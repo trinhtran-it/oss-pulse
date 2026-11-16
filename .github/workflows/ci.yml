@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: ruff check . && ruff format --check .
+      - run: pytest ingestion/tests
+
+  dbt:
+    runs-on: ubuntu-latest
+    needs: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install dbt-bigquery
+      # TODO: configure GCP auth (Workload Identity Federation recommended)
+      - run: dbt deps && dbt build --target ci
+        working-directory: dbt/oss_pulse
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      # TODO: configure GCP auth
+      - run: terraform init -backend=false && terraform validate
+        working-directory: terraform
+      - run: terraform plan -input=false
+        working-directory: terraform

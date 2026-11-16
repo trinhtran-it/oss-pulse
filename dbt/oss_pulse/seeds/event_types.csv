@@ -1,0 +1,7 @@
+event_type,category
+PushEvent,code
+PullRequestEvent,code
+IssuesEvent,collaboration
+IssueCommentEvent,collaboration
+WatchEvent,popularity
+ForkEvent,popularity

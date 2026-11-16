@@ -1,0 +1,7 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: "{{ env_var('BQ_DATASET_RAW', 'oss_pulse_raw') }}"
+    tables:
+      - name: events

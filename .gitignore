@@ -1,0 +1,13 @@
+.env
+*.json.gz
+__pycache__/
+.pytest_cache/
+.venv/
+.terraform/
+*.tfstate*
+dbt/oss_pulse/target/
+dbt/oss_pulse/dbt_packages/
+dbt/oss_pulse/logs/
+airflow/logs/
+
+.bruin.yml

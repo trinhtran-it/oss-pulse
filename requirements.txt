@@ -1,0 +1,5 @@
+requests
+google-cloud-storage
+pytest
+ruff
+dbt-bigquery
