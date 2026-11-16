@@ -11,3 +11,16 @@ dbt/oss_pulse/logs/
 airflow/logs/
 
 .bruin.yml
+# Terraform: real values stay local (commit the *.example files)
+*.tfvars
+backend.hcl
+
+# Secrets / local config
+*-key.json
+credentials*.json
+dbt/oss_pulse/profiles.yml
+
+# OS / tooling
+.DS_Store
+.ruff_cache/
+tfplan

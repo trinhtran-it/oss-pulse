@@ -1,11 +1,19 @@
+output "bucket_name" {
+  description = "Data-lake bucket name (use for GCS_BUCKET)."
+  value       = google_storage_bucket.lake.name
+}
+
 output "bucket_url" {
-  value = google_storage_bucket.lake.url
+  description = "Data-lake bucket URL (gs://...)."
+  value       = google_storage_bucket.lake.url
 }
 
-output "bq_dataset_raw" {
-  value = google_bigquery_dataset.raw.dataset_id
+output "bq_datasets" {
+  description = "BigQuery dataset IDs by layer."
+  value       = { for layer, ds in google_bigquery_dataset.this : layer => ds.dataset_id }
 }
 
-output "bq_dataset_analytics" {
-  value = google_bigquery_dataset.analytics.dataset_id
+output "pipeline_service_account_email" {
+  description = "Email of the pipeline service account."
+  value       = google_service_account.pipeline.email
 }

@@ -35,8 +35,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
-      # TODO: configure GCP auth
-      - run: terraform init -backend=false && terraform validate
+      - name: fmt + validate (no credentials needed)
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
         working-directory: terraform
-      - run: terraform plan -input=false
+      # Plan needs GCP auth + remote state. Enable by setting repo variable TF_PLAN_ENABLED=true
+      # once Workload Identity Federation is configured (TODO: add google-github-actions/auth step).
+      - name: plan
+        if: vars.TF_PLAN_ENABLED == 'true'
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=oss-pulse/dev"
+          terraform plan -input=false -lock=false \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" -var="bucket_name=${{ vars.GCS_BUCKET }}"
         working-directory: terraform

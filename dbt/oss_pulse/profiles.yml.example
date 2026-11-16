@@ -7,13 +7,13 @@ oss_pulse:
       method: service-account
       keyfile: "{{ env_var('GOOGLE_APPLICATION_CREDENTIALS') }}"
       project: "{{ env_var('GCP_PROJECT_ID') }}"
-      dataset: "{{ env_var('BQ_DATASET_ANALYTICS', 'oss_pulse') }}"
-      location: US
+      dataset: "{{ env_var('BQ_DATASET_STAGING', 'oss_pulse_staging') }}"
+      location: "{{ env_var('GCP_REGION', 'us-central1') }}"
       threads: 4
     ci:
       type: bigquery
       method: oauth
       project: "{{ env_var('GCP_PROJECT_ID') }}"
       dataset: oss_pulse_ci
-      location: US
+      location: "{{ env_var('GCP_REGION', 'us-central1') }}"
       threads: 4

@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+project_id  = "your-project-id"
+region      = "us-central1"
+environment = "dev"
+bucket_name = "your-project-id-oss-pulse-lake"
+
+# Optional overrides
+# raw_retention_days = 90
+# bq_dataset_raw     = "oss_pulse_raw"
+# bq_dataset_staging = "oss_pulse_staging"
+# bq_dataset_marts   = "oss_pulse_marts"

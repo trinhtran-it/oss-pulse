@@ -1,22 +1,60 @@
 variable "project_id" {
-  type = string
+  description = "GCP project ID."
+  type        = string
 }
 
 variable "region" {
-  type    = string
-  default = "us-central1"
+  description = "Region for the bucket and BigQuery datasets (keep them in the same location)."
+  type        = string
+  default     = "us-central1"
+}
+
+variable "environment" {
+  description = "Deployment environment. `dev` enables force_destroy on the bucket and datasets."
+  type        = string
+  default     = "dev"
+
+  validation {
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "environment must be \"dev\" or \"prod\"."
+  }
 }
 
 variable "bucket_name" {
-  type = string
+  description = "Globally unique name of the data-lake bucket."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$", var.bucket_name))
+    error_message = "bucket_name must be 3-63 chars: lowercase letters, digits, '-', '_' or '.'."
+  }
+}
+
+variable "raw_retention_days" {
+  description = "Delete objects under raw/ after this many days."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.raw_retention_days > 0
+    error_message = "raw_retention_days must be positive."
+  }
 }
 
 variable "bq_dataset_raw" {
-  type    = string
-  default = "oss_pulse_raw"
+  description = "Dataset for raw events loaded from GCS."
+  type        = string
+  default     = "oss_pulse_raw"
 }
 
-variable "bq_dataset_analytics" {
-  type    = string
-  default = "oss_pulse"
+variable "bq_dataset_staging" {
+  description = "Dataset for dbt staging models and seeds."
+  type        = string
+  default     = "oss_pulse_staging"
+}
+
+variable "bq_dataset_marts" {
+  description = "Dataset for dbt marts."
+  type        = string
+  default     = "oss_pulse_marts"
 }

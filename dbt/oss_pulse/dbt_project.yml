@@ -8,11 +8,19 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 test-paths: ["tests"]
 
+# Datasets are created by Terraform (terraform/main.tf); dbt only writes into them.
+# See macros/generate_schema_name.sql for how targets map to datasets.
 models:
   oss_pulse:
     staging:
       +materialized: view
+      +schema: "{{ env_var('BQ_DATASET_STAGING', 'oss_pulse_staging') }}"
     intermediate:
       +materialized: ephemeral
     marts:
       +materialized: table
+      +schema: "{{ env_var('BQ_DATASET_MARTS', 'oss_pulse_marts') }}"
+
+seeds:
+  oss_pulse:
+    +schema: "{{ env_var('BQ_DATASET_STAGING', 'oss_pulse_staging') }}"

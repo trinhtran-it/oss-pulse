@@ -5,4 +5,5 @@ models:
     description: One row per repo per day with activity counts.
     tests:
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns: [event_date, repo_id]
+          arguments:
+            combination_of_columns: [event_date, repo_id]
