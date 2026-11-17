@@ -53,6 +53,34 @@ make tf-apply
 make tf-output      # bucket URL, dataset IDs, service account email
 ```
 
+## Ingestion (GH Archive → GCS raw)
+
+[ingestion/gharchive.py](ingestion/gharchive.py) streams each hourly file over HTTP **directly into GCS**, without writing to local disk:
+
+```
+https://data.gharchive.org/2026-10-01-15.json.gz
+  → gs://$GCS_BUCKET/raw/gharchive/dt=2026-10-01/hr=15/2026-10-01-15.json.gz
+```
+
+```bash
+make ingest DATE=2026-10-01                 # all 24 hours
+make ingest DATE=2026-10-01 HOURS=0-5,12    # selected hours
+make ingest DATE=2026-10-01 ARGS=--force    # re-upload even if unchanged
+make ingest-docker DATE=2026-10-01          # same, in the container (mounts your ADC login read-only)
+```
+
+| Behavior | Detail |
+|---|---|
+| Retries | Up to 3 attempts per hour (`INGEST_MAX_ATTEMPTS`), exponential backoff with jitter, on network errors, HTTP 5xx/429 and GCS 5xx/429. Other 4xx errors fail immediately |
+| 404 | Recorded as `missing` (not published yet, or a known gap); the other hours still run |
+| Idempotent | Same object path on every run. An hour is **skipped** if the object already exists with the same size; `--force` overwrites |
+| No partial files | The upload only becomes an object when the stream completes. A size mismatch against `Content-Length` deletes the object and retries |
+| Logging | One JSON line per hour (`hour`, `status`, `bytes`, `duration_s`, `attempts`), plus a `run_summary` line, e.g. `24/24 ok` or `22/24 ok; missing hours [3, 4]` |
+| Exit codes | `0` ok · `1` an hour failed · `2` usage/config error · `3` only missing hours (`--allow-missing` → 0). Any non-zero code fails the Airflow task, so it retries |
+| Config | Environment variables only: `GCS_BUCKET` (required), `GCS_RAW_PREFIX`, `GHARCHIVE_BASE_URL`, `INGEST_MAX_ATTEMPTS`, `GCP_PROJECT_ID` |
+
+Tests (`make test`) cover the pure functions and use a fake HTTP session and bucket for retries, skipping and exit codes. They need no network or credentials.
+
 ## How to run
 ```bash
 cp .env.example .env   # fill in values

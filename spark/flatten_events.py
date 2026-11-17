@@ -24,16 +24,18 @@ def flatten(df):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="e.g. gs://bucket/raw/gharchive/dt=2026-01-01/")
+    parser.add_argument(
+        "--input", required=True, help="e.g. gs://bucket/raw/gharchive/dt=2026-01-01/"
+    )
     parser.add_argument("--output", required=True, help="e.g. gs://bucket/staged/events/")
     args = parser.parse_args()
 
     spark = SparkSession.builder.appName("oss-pulse-flatten-events").getOrCreate()
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
-    flatten(spark.read.json(args.input)).write.mode("overwrite").partitionBy(
-        "event_date"
-    ).parquet(args.output)
+    flatten(spark.read.json(args.input)).write.mode("overwrite").partitionBy("event_date").parquet(
+        args.output
+    )
 
     spark.stop()
 

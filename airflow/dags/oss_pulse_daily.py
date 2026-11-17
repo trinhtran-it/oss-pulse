@@ -22,7 +22,8 @@ with DAG(
 ) as dag:
     ingest = BashOperator(
         task_id="ingest_gharchive",
-        bash_command="python /opt/airflow/ingestion/gharchive.py --date {{ ds }}",
+        # exit 1 = failed hours, 3 = hours not published yet: both fail the task so Airflow retries.
+        bash_command="cd /opt/airflow && python -m ingestion.gharchive --date {{ ds }}",
     )
 
     flatten = BashOperator(

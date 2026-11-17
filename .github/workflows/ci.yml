@@ -13,9 +13,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements-dev.txt
       - run: ruff check . && ruff format --check .
-      - run: pytest ingestion/tests
+      - run: pytest
+      - name: build ingestion image
+        run: docker build -f ingestion/Dockerfile -t oss-pulse-ingestion .
 
   dbt:
     runs-on: ubuntu-latest

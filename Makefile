@@ -1,4 +1,4 @@
-.PHONY: setup up down backfill test lint tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
+.PHONY: setup up down backfill test lint ingest ingest-image ingest-docker tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
 
 # Load local settings (GCP_PROJECT_ID, GCP_REGION, TF_STATE_BUCKET, ...) if present.
 -include .env
@@ -10,7 +10,7 @@ START ?= $(shell date -v-1d +%Y-%m-%d 2>/dev/null || date -d yesterday +%Y-%m-%d
 END   ?= $(START)
 
 setup:
-	python -m venv .venv && .venv/bin/pip install -r requirements.txt
+	python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 up:
 	docker compose -f airflow/docker-compose.yml up -d
@@ -23,11 +23,28 @@ backfill:
 		airflow dags backfill oss_pulse_daily -s $(START) -e $(END)
 
 test:
-	.venv/bin/pytest ingestion/tests
+	.venv/bin/pytest
 
 lint:
 	.venv/bin/ruff check .
 	.venv/bin/ruff format --check .
+
+# --- Ingestion (GH Archive -> GCS raw) ------------------------------------------
+# make ingest DATE=2026-10-01 [HOURS=0-23] [ARGS="--force"]
+DATE  ?= $(START)
+HOURS ?= 0-23
+
+ingest:
+	.venv/bin/python -m ingestion.gharchive --date $(DATE) --hours $(HOURS) $(ARGS)
+
+ingest-image:
+	docker build -f ingestion/Dockerfile -t oss-pulse-ingestion .
+
+# Same job in the container, using your ADC login (read-only mount).
+ingest-docker: ingest-image
+	docker run --rm -e GCS_BUCKET -e GCP_PROJECT_ID \
+		-v $(HOME)/.config/gcloud:/home/app/.config/gcloud:ro \
+		oss-pulse-ingestion --date $(DATE) --hours $(HOURS) $(ARGS)
 
 # --- Terraform -----------------------------------------------------------------
 
