@@ -1,0 +1,2 @@
+# Local Spark for development and tests. Dataproc Serverless provides its own Spark runtime.
+pyspark>=3.5,<5

@@ -58,3 +58,14 @@ variable "bq_dataset_marts" {
   type        = string
   default     = "oss_pulse_marts"
 }
+
+variable "dataproc_subnet_cidr" {
+  description = "IP range of the subnet used by Dataproc Serverless batches."
+  type        = string
+  default     = "10.10.0.0/24"
+
+  validation {
+    condition     = can(cidrhost(var.dataproc_subnet_cidr, 0))
+    error_message = "dataproc_subnet_cidr must be a valid CIDR block, e.g. 10.10.0.0/24."
+  }
+}

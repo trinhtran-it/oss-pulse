@@ -17,3 +17,8 @@ output "pipeline_service_account_email" {
   description = "Email of the pipeline service account."
   value       = google_service_account.pipeline.email
 }
+
+output "dataproc_subnet" {
+  description = "Subnet name for `gcloud dataproc batches submit --subnet`."
+  value       = google_compute_subnetwork.pipeline.name
+}

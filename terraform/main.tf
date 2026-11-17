@@ -41,6 +41,8 @@ locals {
 resource "google_project_service" "apis" {
   for_each = toset([
     "bigquery.googleapis.com",
+    "compute.googleapis.com", # VPC for Dataproc Serverless
+    "dataproc.googleapis.com",
     "iam.googleapis.com",
     "storage.googleapis.com",
   ])
@@ -120,5 +122,42 @@ resource "google_project_iam_member" "pipeline_job_user" {
   member  = google_service_account.pipeline.member
 }
 
-# TODO (if Dataproc Serverless is used for Spark): add roles/dataproc.worker and
-# grant the caller roles/iam.serviceAccountUser on this service account.
+# Run Dataproc Serverless batches as this SA. Note: Google's dataproc.worker role also grants
+# storage.objects.* project-wide (needed for Dataproc staging/temp buckets), which is broader
+# than the bucket-level grant above. The submitter needs iam.serviceAccountUser on this SA
+# (project Owners have it).
+resource "google_project_iam_member" "pipeline_dataproc_worker" {
+  project = var.project_id
+  role    = "roles/dataproc.worker"
+  member  = google_service_account.pipeline.member
+}
+
+# --- Network for Dataproc Serverless ------------------------------------------
+# Serverless Spark workers have no external IPs: the subnet needs Private Google Access to reach
+# GCS/BigQuery, and Spark driver/executors must reach each other on any port inside the subnet.
+
+resource "google_compute_network" "pipeline" {
+  name                    = "oss-pulse-vpc"
+  auto_create_subnetworks = false
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_compute_subnetwork" "pipeline" {
+  name                     = "oss-pulse-subnet"
+  region                   = var.region
+  network                  = google_compute_network.pipeline.id
+  ip_cidr_range            = var.dataproc_subnet_cidr
+  private_ip_google_access = true
+}
+
+resource "google_compute_firewall" "pipeline_internal" {
+  name          = "oss-pulse-allow-internal"
+  network       = google_compute_network.pipeline.id
+  direction     = "INGRESS"
+  source_ranges = [var.dataproc_subnet_cidr]
+
+  allow {
+    protocol = "all"
+  }
+}

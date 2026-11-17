@@ -1,5 +1,6 @@
 .env
 *.json.gz
+data/
 __pycache__/
 .pytest_cache/
 .venv/
@@ -24,3 +25,8 @@ dbt/oss_pulse/profiles.yml
 .DS_Store
 .ruff_cache/
 tfplan
+
+# Spark local runs
+spark-warehouse/
+metastore_db/
+derby.log

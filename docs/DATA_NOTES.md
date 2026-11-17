@@ -21,7 +21,7 @@ Findings from profiling sample hours on 2026-11-12. The numbers come from single
 
 - **Grain:** one row = one public GitHub event.
 - **Key:** `id`, a **string** of digits. Keep it as `STRING` and don't cast it to an integer, because the key must stay stable if the format changes.
-- No duplicate `id`s were found within any sample hour. Deduplicate on `id` anyway (`insert_overwrite` per partition plus a `unique` test), because re-runs and backfills can load the same hour twice.
+- No duplicate `id`s were found within any single sample hour, but **across the full day 2026-10-01 there were 79 duplicates** in 2,073,894 events (same `id` in two hourly files). Spark de-duplicates on `id` per day; keep a `unique` test in dbt as well.
 
 ## Volume
 
@@ -62,7 +62,7 @@ Spark should flatten to these columns, using an **explicit schema** rather than 
 | `release_tag` | `payload.release.tag_name` | STRING | Release events |
 | `payload_json` | `to_json(payload)` | STRING | Raw copy, kept so new fields can be extracted later without re-ingesting |
 
-> TODO (Step 4): `spark/flatten_events.py` currently infers the schema and keeps only part of this list. Switch it to an explicit `StructType` and set `spark.sql.session.timeZone=UTC`.
+> Implemented in `spark/flatten_events.py` (explicit `StructType`, session time zone UTC). It also adds `event_hour`, `repo_owner` (`repo_name` before the `/`) and `source_file` (input file path, for lineage).
 
 ## Event types and metric rules
 
@@ -89,7 +89,7 @@ Keep these rules in one dbt model (`int_events_classified`) instead of repeating
 
 **Nulls**
 - `org` is null for **~57–71%** of events (repos owned by users rather than organizations). This is expected, so `org_*` columns must be nullable.
-- Fields extracted from `payload` are null whenever the event type doesn't have them. Use `not_null` tests only on `event_id`, `event_type`, `created_at`, `actor_id` and `repo_id`; those had no nulls in any sample.
+- Fields extracted from `payload` are null whenever the event type doesn't have them. Use `not_null` tests only on `event_id`, `event_type`, `created_at` and `actor_id`. **Not `repo_id`**: the 2026-10-01 15:00 sample has 1 `ForkEvent` with `"repo": {}` (1 in 85,569). Keep the row, and let marts that group by repo filter `repo_id IS NOT NULL`.
 
 **Missing `PushEvent` fields and payload changes**
 - Around early Oct 2025 (when hourly file size fell ~3× with the same event count), `PushEvent` payloads **lost `commits`, `size` and `distinct_size`**. Only `before`, `head`, `push_id`, `ref` and `repository_id` remain.

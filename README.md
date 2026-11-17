@@ -81,6 +81,34 @@ make ingest-docker DATE=2026-10-01          # same, in the container (mounts you
 
 Tests (`make test`) cover the pure functions and use a fake HTTP session and bucket for retries, skipping and exit codes. They need no network or credentials.
 
+## Processing (Spark → processed/events)
+
+[spark/flatten_events.py](spark/flatten_events.py) turns one day of raw JSON into typed Parquet:
+
+```
+gs://$GCS_BUCKET/raw/gharchive/dt=2026-10-01/hr=*/…json.gz
+  → gs://$GCS_BUCKET/processed/events/dt=2026-10-01/part-*.snappy.parquet
+```
+
+```bash
+make spark-local    DATE=2026-10-01   # data/sample/ → data/processed/events (needs Java 17)
+make spark-dataproc DATE=2026-10-01   # gs:// → gs:// on Dataproc Serverless
+```
+
+| Behavior | Detail |
+|---|---|
+| Schema | Explicit `StructType`, no inference. Payload fields from [DATA_NOTES](docs/DATA_NOTES.md); the raw payload is kept as `payload_json` |
+| Columns | `event_id`, `event_type`, `created_at` (UTC timestamp), `event_date`, `event_hour`, actor/repo/org ids and names, `repo_owner`, `payload_action`, `pr_number`, `pr_merged`, `issue_number`, `push_size`, `ref`, `release_tag`, `payload_json`, `source_file` |
+| Time zone | Session time zone fixed to UTC; a test runs the JVM in America/Los_Angeles to prove dates don't shift |
+| Cleaning | Drops corrupt JSON, rows missing id/type/timestamp, and rows outside `--date`; de-duplicates on `event_id` |
+| Quality gate | Exits 1 **without writing** if there's no input, no valid rows, corrupt+invalid rows exceed `--max-bad-fraction` (default 1%), or rows dated outside `--date` exceed `--max-out-of-range-fraction` (default 1%), which catches time-zone bugs and wrong input paths |
+| Idempotent | Overwrites exactly `processed/events/dt=<date>/`; other dates are untouched |
+| Output | Snappy Parquet, `TIMESTAMP_MICROS` (BigQuery-friendly), files of ~128 MB (AQE) |
+| Logging | JSON lines on the driver: `input_rows`, `corrupt_rows`, `invalid_rows`, `out_of_range_rows`, `duplicate_rows`, `output_rows` |
+| Spark versions | Tested locally on Spark 4.3; ANSI-safe (`try_to_timestamp`), so it also runs on Spark 3.5 runtimes |
+
+**Why Dataproc Serverless:** no cluster to create, size or remember to delete; you pay only while the batch runs. It runs as the `oss-pulse-pipeline` service account, inside `oss-pulse-subnet` (Private Google Access, no public IPs), both created by Terraform.
+
 ## How to run
 ```bash
 cp .env.example .env   # fill in values

@@ -1,3 +1,4 @@
 -r ingestion/requirements.txt
+-r spark/requirements.txt
 pytest>=8,<9
 ruff>=0.6

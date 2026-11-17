@@ -28,7 +28,8 @@ with DAG(
 
     flatten = BashOperator(
         task_id="spark_flatten_events",
-        bash_command="echo 'TODO: submit spark/flatten_events.py for {{ ds }}'",
+        # TODO (orchestration): DataprocCreateBatchOperator, same as `make spark-dataproc`.
+        bash_command="echo 'TODO: submit spark/flatten_events.py for {{ ds }} on Dataproc'",
     )
 
     dbt_build = BashOperator(
