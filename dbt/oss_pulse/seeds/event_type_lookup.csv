@@ -1,0 +1,17 @@
+event_type,category,description
+WatchEvent,engagement,Star (payload_action = started)
+ForkEvent,engagement,Fork
+PushEvent,code,Commits pushed to a branch
+CreateEvent,code,Branch or tag created
+DeleteEvent,code,Branch or tag deleted
+PullRequestEvent,code,"Pull request opened, merged, closed, labeled or assigned"
+PullRequestReviewEvent,code,Pull request review submitted
+PullRequestReviewCommentEvent,code,Comment on a pull request diff
+CommitCommentEvent,collaboration,Comment on a commit
+IssuesEvent,collaboration,"Issue opened, closed, labeled or assigned"
+IssueCommentEvent,collaboration,Comment on an issue or pull request
+DiscussionEvent,collaboration,Discussion created
+GollumEvent,collaboration,Wiki page created or edited
+ReleaseEvent,community,Release published
+MemberEvent,community,Collaborator added to a repository
+PublicEvent,community,Repository made public

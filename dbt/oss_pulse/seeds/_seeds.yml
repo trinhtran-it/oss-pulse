@@ -1,0 +1,29 @@
+version: 2
+
+seeds:
+  - name: event_type_lookup
+    description: One row per GitHub event type, with a reporting category. Covers all 16 types seen in raw.events.
+    columns:
+      - name: event_type
+        description: GitHub event type, e.g. WatchEvent.
+        data_tests: [unique, not_null]
+      - name: category
+        description: Reporting group.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [engagement, code, collaboration, community]
+      - name: description
+        description: Plain-language meaning of the event.
+
+  - name: known_bots
+    description: >
+      Bot accounts whose login does NOT end in "[bot]" (those are caught by the suffix rule in
+      macros/is_bot.sql). Found by looking at high-volume, multi-repo or bot-named logins in
+      raw.events. Lowercase.
+    columns:
+      - name: login
+        description: GitHub login, lowercase.
+        data_tests: [unique, not_null]
+      - name: reason
+        description: Why this account is classified as a bot (evidence).

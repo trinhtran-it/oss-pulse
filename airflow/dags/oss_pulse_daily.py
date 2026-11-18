@@ -34,7 +34,12 @@ with DAG(
 
     dbt_build = BashOperator(
         task_id="dbt_build",
-        bash_command="cd /opt/airflow/dbt/oss_pulse && dbt build --vars '{run_date: {{ ds }}}'",
+        # Rebuilds {{ ds }} and the day before (lookback_days); tests gate downstream models.
+        bash_command=(
+            "dbt build --project-dir /opt/airflow/dbt/oss_pulse "
+            "--profiles-dir /opt/airflow/dbt/oss_pulse --target prod "
+            "--vars '{run_date: {{ ds }}}'"
+        ),
     )
 
     ingest >> flatten >> dbt_build

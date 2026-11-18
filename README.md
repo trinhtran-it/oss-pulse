@@ -149,6 +149,46 @@ Within a day, almost every metric starts from **one event type** (stars = `Watch
 - A dry run is an upper bound on bytes *processed*: a real job can prune more at run time, never less (billing still rounds up to the 10 MB minimum). Here, with a constant filter on the clustering column, the dry run already matched the real job (894,086 bytes). When the filter value comes from a subquery (`event_type IN (SELECT 'WatchEvent')`), BigQuery could not prune blocks at all: 97.7 MB, about 109× more. Filter clustered columns with constants or query parameters. `cost_demo.sh` still reports real job statistics, not estimates.
 - The numbers and job IDs are in [docs/bq_cost_results.json](docs/bq_cost_results.json); [warehouse/plot_cost.py](warehouse/plot_cost.py) draws the chart from that file.
 
+## Transformation (dbt)
+
+[dbt/oss_pulse/](dbt/oss_pulse/) builds the analytics models from `raw.events` (dbt-core 1.12 + dbt-bigquery).
+
+![dbt lineage](docs/dbt_lineage.png)
+
+| Layer | Model | Materialization | Grain / purpose |
+|---|---|---|---|
+| Staging | `stg_events` | view | 1:1 with `raw.events`; renamed, typed, lowercased; `payload_json` left out (78% of bytes) |
+| Intermediate | `int_events_enriched` | view | Adds `event_category` (seed), `is_bot` (macro) and metric flags (`is_star`, `is_pr_merged`, …) in one place |
+| Marts | `fct_events` | incremental, `insert_overwrite` | One row per event; FKs to the dims; partitioned by `event_date`, clustered by `event_type, repo_id` |
+| | `agg_repo_daily` | incremental, `insert_overwrite` | One row per repo × day: stars, forks, pushes, PRs opened/merged, issues opened, unique actors. **Bots excluded** |
+| | `dim_repo` | incremental, `merge` | One row per `repo_id`: latest name/owner, first/last seen |
+| | `dim_actor` | incremental, `merge` | One row per `actor_id`: latest login, `is_bot`, first/last seen |
+| | `dim_date` | table | Calendar from `dbt_utils.date_spine` |
+
+```bash
+make dbt-deps && make dbt-debug
+make dbt-build                                   # dev: everything since history_start_date
+make dbt-build DBT_TARGET=prod RUN_DATE=2026-10-03   # daily: rebuild run_date and the day before
+make dbt-freshness                               # source freshness (warn 26h, error 50h)
+make dbt-docs                                    # target/static_index.html
+```
+
+**Environments.** `dev` writes everything to your own dataset (`DBT_DEV_DATASET`, e.g. `dbt_<yourname>`). `prod` writes to the Terraform-managed `oss_pulse_staging` and `oss_pulse_marts`. `ci` writes to `oss_pulse_ci`. [profiles.yml](dbt/oss_pulse/profiles.yml) is committed: every value comes from `env_var()`, and auth is OAuth through ADC. Each query is capped by `maximum_bytes_billed` (10 GB).
+
+**Incremental design.** One macro, [event_window](dbt/oss_pulse/macros/event_window.sql), decides which days a run rebuilds: `run_date` minus `lookback_days` up to `run_date`, or all history on a first build. Its bounds are constants, so BigQuery prunes partitions and `raw.events`' required partition filter is satisfied. The fact and aggregate tables replace partitions with **copy jobs** (`copy_partitions: true`), which cut a 2-day run from 987 MB to 333 MB processed. Re-running a day replaces it, so runs are idempotent (tested: identical row counts).
+
+**Tests (41 per build, all passing):**
+- `unique` + `not_null` on every primary key, and `unique_combination_of_columns` for `agg_repo_daily`.
+- `relationships` from `fct_events` to `dim_repo`, `dim_actor` and `dim_date`.
+- `accepted_values` on `event_type`, with all 16 types.
+- A singular test, [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql).
+- A **unit test** for `is_bot`: `dependabot[bot]` and `COPILOT` → bot; `abbot` and `octocat` → not a bot.
+- Tests on the raw-backed views carry a `where:` filter on `created_at`.
+
+**Bots.** [is_bot](dbt/oss_pulse/macros/is_bot.sql) flags logins ending in `[bot]` plus a seed of service accounts that don't. The biggest is `copilot`, with 16k events across 6.5k repos in three days. The seed is evidence-based ([known_bots.csv](dbt/oss_pulse/seeds/known_bots.csv)). Automation running under personal-looking accounts can't be detected by name and remains counted as human.
+
+**Breaking it on purpose:** a duplicate event made `dbt build` fail and **skip** `agg_repo_daily`, so the bad data never reached the dashboard. Re-running the day fixed it. Write-up: [docs/DEVLOG.md](docs/DEVLOG.md).
+
 ## How to run
 ```bash
 cp .env.example .env   # fill in values

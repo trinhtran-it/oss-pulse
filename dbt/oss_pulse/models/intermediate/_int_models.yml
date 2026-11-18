@@ -1,0 +1,15 @@
+version: 2
+
+models:
+  - name: int_events_enriched
+    description: >
+      stg_events plus event_category (seed), is_bot (macro) and the metric flags every mart counts.
+      WatchEvents other than action "started" are dropped. A view: filter created_at when querying.
+    columns:
+      - name: event_id
+        data_tests:
+          - not_null:
+              config:
+                where: "created_at >= timestamp('{{ var('history_start_date') }}')"
+      - name: is_bot
+        description: See macros/is_bot.sql.

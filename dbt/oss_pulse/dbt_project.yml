@@ -7,16 +7,33 @@ model-paths: ["models"]
 seed-paths: ["seeds"]
 macro-paths: ["macros"]
 test-paths: ["tests"]
+clean-targets: ["target", "dbt_packages"]
 
-# Datasets are created by Terraform (terraform/main.tf); dbt only writes into them.
-# See macros/generate_schema_name.sql for how targets map to datasets.
+vars:
+  # First day loaded into raw.events. Full builds start here; tests on raw-backed views filter on it.
+  history_start_date: "2026-10-01"
+  # Set by the orchestrator for incremental runs: --vars '{run_date: 2026-10-02}'.
+  # Unset -> incremental models rebuild everything since history_start_date.
+  run_date: null
+  # Incremental runs also rebuild this many days before run_date (late or re-run upstream days).
+  lookback_days: 1
+  # dim_date covers history_start_date .. date_spine_end (exclusive).
+  date_spine_end: "2028-01-01"
+
+# Datasets: Terraform creates oss_pulse_staging / oss_pulse_marts; dbt only writes into them.
+# The `prod` target uses these +schema values as-is; dev/ci write everything to their own dataset
+# (see macros/generate_schema_name.sql).
 models:
   oss_pulse:
+    +persist_docs:
+      relation: true
+      columns: true # descriptions show up in the BigQuery console too
     staging:
       +materialized: view
       +schema: "{{ env_var('BQ_DATASET_STAGING', 'oss_pulse_staging') }}"
     intermediate:
-      +materialized: ephemeral
+      +materialized: view
+      +schema: "{{ env_var('BQ_DATASET_STAGING', 'oss_pulse_staging') }}"
     marts:
       +materialized: table
       +schema: "{{ env_var('BQ_DATASET_MARTS', 'oss_pulse_marts') }}"
@@ -24,3 +41,7 @@ models:
 seeds:
   oss_pulse:
     +schema: "{{ env_var('BQ_DATASET_STAGING', 'oss_pulse_staging') }}"
+    event_type_lookup:
+      +column_types: { event_type: string, category: string, description: string }
+    known_bots:
+      +column_types: { login: string, reason: string }

@@ -1,5 +1,8 @@
 -r ingestion/requirements.txt
 -r spark/requirements.txt
+-r dbt/requirements.txt
+# pyspark doesn't fully support pandas 3 yet; dbt-bigquery would otherwise pull it in
+pandas>=2.2,<3
 matplotlib>=3.8,<4  # warehouse/plot_cost.py
 pytest>=8,<9
 ruff>=0.6

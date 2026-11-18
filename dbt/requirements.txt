@@ -1,0 +1,3 @@
+# dbt (core + BigQuery adapter). Called as .venv/bin/dbt so it never collides with a global dbt.
+dbt-core>=1.12,<1.13
+dbt-bigquery>=1.12,<1.13

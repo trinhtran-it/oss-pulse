@@ -1,0 +1,15 @@
+login,reason
+copilot,GitHub Copilot coding agent: 16k events across 6.5k repos in 3 days (2026-10-01..03)
+renovate-bot,Renovate dependency updates (self-hosted account)
+regro-cf-autotick-bot,conda-forge version bump automation
+ropensci-bot,rOpenSci automation
+stdlib-bot,stdlib-js automation
+matticbot,Automattic automation
+svc-excavator-bot,Palantir Excavator automated refactors
+release-service-bot,Release automation across 700+ repos
+brewtestbot,Homebrew CI
+wingetbot,winget-pkgs automation
+lizardbyte-bot,LizardByte automation
+openfoodfacts-bot,Open Food Facts automation
+fbc-release-e2e-bot,Release e2e test automation
+konflux-ci-qe-bot,Konflux CI QE automation

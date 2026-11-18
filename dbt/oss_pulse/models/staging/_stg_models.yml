@@ -2,8 +2,23 @@ version: 2
 
 models:
   - name: stg_events
+    description: >
+      raw.events, one row per event, renamed, typed and lowercased (logins, repo names, actions).
+      payload_json is excluded. Queries must filter created_at (partition filter required).
     columns:
       - name: event_id
-        tests: [not_null, unique]
+        description: GitHub event id (string).
+        data_tests:
+          - unique:
+              config:
+                where: "created_at >= timestamp('{{ var('history_start_date') }}')"
+          - not_null:
+              config:
+                where: "created_at >= timestamp('{{ var('history_start_date') }}')"
       - name: event_type
-        tests: [not_null]
+        data_tests:
+          - not_null:
+              config:
+                where: "created_at >= timestamp('{{ var('history_start_date') }}')"
+      - name: created_at
+        description: Event time, UTC.

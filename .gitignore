@@ -19,7 +19,6 @@ backend.hcl
 # Secrets / local config
 *-key.json
 credentials*.json
-dbt/oss_pulse/profiles.yml
 
 # OS / tooling
 .DS_Store
@@ -30,3 +29,6 @@ tfplan
 spark-warehouse/
 metastore_db/
 derby.log
+
+# dbt local state (anonymous usage id)
+dbt/oss_pulse/.user.yml

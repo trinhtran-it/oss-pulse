@@ -31,10 +31,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install dbt-bigquery
-      # TODO: configure GCP auth (Workload Identity Federation recommended)
-      - run: dbt deps && dbt build --target ci
-        working-directory: dbt/oss_pulse
+      - run: pip install -r dbt/requirements.txt
+      # Static checks, no GCP credentials needed: Jinja, refs, YAML, tests and unit-test definitions.
+      - name: dbt deps + parse
+        env:
+          GCP_PROJECT_ID: ci-placeholder
+          DBT_TARGET: ci
+        run: |
+          dbt deps --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse
+          dbt parse --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse
+      # TODO (orchestration step): with Workload Identity Federation, run
+      #   dbt build --target ci --empty   (schema-only build + unit tests in oss_pulse_ci)
 
   terraform:
     runs-on: ubuntu-latest

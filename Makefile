@@ -1,4 +1,4 @@
-.PHONY: setup up down backfill test lint ingest ingest-image ingest-docker spark-local spark-dataproc bq-table bq-load bq-cost-demo bq-cost-chart tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
+.PHONY: setup up down backfill test lint ingest ingest-image ingest-docker spark-local spark-dataproc bq-table bq-load bq-cost-demo bq-cost-chart dbt-deps dbt-debug dbt-build dbt-test dbt-freshness dbt-docs tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
 
 # Load local settings (GCP_PROJECT_ID, GCP_REGION, TF_STATE_BUCKET, ...) if present.
 -include .env
@@ -93,6 +93,35 @@ bq-cost-demo:
 
 bq-cost-chart:
 	.venv/bin/python warehouse/plot_cost.py
+
+# --- dbt ----------------------------------------------------------------------------
+# make dbt-build                                  # dev target (DBT_DEV_DATASET), all history
+# make dbt-build DBT_TARGET=prod RUN_DATE=2026-10-03  # incremental: rebuild run_date (+lookback)
+DBT_TARGET ?= dev
+RUN_DATE   ?=
+DBT_SELECT ?=
+DBT        := .venv/bin/dbt
+DBT_FLAGS   = --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target $(DBT_TARGET)
+DBT_VARS    = $(if $(RUN_DATE),--vars '{run_date: $(RUN_DATE)}')
+DBT_SEL     = $(if $(DBT_SELECT),--select $(DBT_SELECT))
+
+dbt-deps:
+	$(DBT) deps $(DBT_FLAGS)
+
+dbt-debug:
+	$(DBT) debug $(DBT_FLAGS)
+
+dbt-build:
+	$(DBT) build $(DBT_FLAGS) $(DBT_VARS) $(DBT_SEL)
+
+dbt-test:
+	$(DBT) test $(DBT_FLAGS) $(DBT_VARS) $(DBT_SEL)
+
+dbt-freshness:
+	$(DBT) source freshness $(DBT_FLAGS)
+
+dbt-docs:
+	$(DBT) docs generate $(DBT_FLAGS) --static
 
 # --- Terraform -----------------------------------------------------------------
 

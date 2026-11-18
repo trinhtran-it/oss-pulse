@@ -1,9 +1,211 @@
 version: 2
 
 models:
-  - name: fct_repo_daily
-    description: One row per repo per day with activity counts.
-    tests:
+  - name: dim_date
+    description: Calendar dimension, one row per day from history_start_date to date_spine_end (dbt_utils.date_spine).
+    columns:
+      - name: date_day
+        description: The calendar date (primary key).
+        data_tests: [unique, not_null]
+      - name: year
+        description: Calendar year.
+      - name: quarter
+        description: Calendar quarter (1-4).
+      - name: month
+        description: Month number (1-12).
+      - name: month_name
+        description: Month name, e.g. October.
+      - name: month_start
+        description: First day of the month.
+      - name: iso_week
+        description: ISO 8601 week number.
+      - name: iso_week_start
+        description: Monday of the ISO week.
+      - name: day_of_week
+        description: Day of week, 1 = Sunday ... 7 = Saturday (BigQuery convention).
+      - name: day_name
+        description: Day name, e.g. Monday.
+      - name: is_weekend
+        description: TRUE on Saturday and Sunday.
+
+  - name: dim_repo
+    description: >
+      One row per GitHub repository. repo_name and repo_owner are taken from the most recent event,
+      because repositories can be renamed or transferred. Incremental merge on repo_id.
+    columns:
+      - name: repo_id
+        description: GitHub repository id (primary key). Stable across renames.
+        data_tests: [unique, not_null]
+      - name: repo_name
+        description: owner/name at the most recent event, lowercase.
+        data_tests: [not_null]
+      - name: repo_owner
+        description: Owner part of repo_name (user or organization login), lowercase.
+      - name: repo_url
+        description: https://github.com/<repo_name>.
+      - name: first_seen_at
+        description: Earliest event for this repo in the loaded history (UTC), not the repo's creation date.
+      - name: last_seen_at
+        description: Latest event for this repo in the loaded history (UTC).
+
+  - name: dim_actor
+    description: >
+      One row per GitHub account that triggered an event (user, organization member or bot).
+      Incremental merge on actor_id.
+    columns:
+      - name: actor_id
+        description: GitHub account id (primary key).
+        data_tests: [unique, not_null]
+      - name: actor_login
+        description: Login at the most recent event, lowercase.
+      - name: is_bot
+        description: >
+          TRUE for GitHub Apps (login ends in "[bot]") and accounts listed in seeds/known_bots.csv.
+          See macros/is_bot.sql.
+        data_tests: [not_null]
+      - name: first_seen_at
+        description: Earliest event by this account in the loaded history (UTC).
+      - name: last_seen_at
+        description: Latest event by this account in the loaded history (UTC).
+
+  - name: fct_events
+    description: >
+      Fact table, one row per GitHub event. Partitioned by event_date and clustered by
+      event_type, repo_id. Incremental insert_overwrite: a run replaces only the days it rebuilds.
+    columns:
+      - name: event_id
+        description: GitHub event id (primary key).
+        data_tests: [unique, not_null]
+      - name: event_date
+        description: UTC date of created_at. Partition column; foreign key to dim_date.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_day
+      - name: created_at
+        description: Event timestamp, UTC.
+        data_tests: [not_null]
+      - name: event_hour
+        description: UTC hour of created_at (0-23).
+      - name: event_type
+        description: GitHub event type.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - WatchEvent
+                  - ForkEvent
+                  - PushEvent
+                  - CreateEvent
+                  - DeleteEvent
+                  - PullRequestEvent
+                  - PullRequestReviewEvent
+                  - PullRequestReviewCommentEvent
+                  - CommitCommentEvent
+                  - IssuesEvent
+                  - IssueCommentEvent
+                  - DiscussionEvent
+                  - GollumEvent
+                  - ReleaseEvent
+                  - MemberEvent
+                  - PublicEvent
+      - name: event_category
+        description: Reporting group from seeds/event_type_lookup.csv ('other' if the type is unknown).
+      - name: repo_id
+        description: Foreign key to dim_repo. NULL in rare upstream events with an empty repo object.
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_repo')
+                field: repo_id
+      - name: actor_id
+        description: Foreign key to dim_actor.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_actor')
+                field: actor_id
+      - name: org_id
+        description: Organization id; NULL for repositories owned by a user.
+      - name: is_bot
+        description: TRUE if the actor is a bot (macros/is_bot.sql) at the time of the event.
+      - name: payload_action
+        description: Action within the event type (e.g. opened, merged, started), lowercase. NULL for types without actions.
+      - name: pr_number
+        description: Pull request number, for pull-request events.
+      - name: issue_number
+        description: Issue number, for issue and issue-comment events.
+      - name: is_star
+        description: TRUE for a star (WatchEvent with action started).
+      - name: is_fork
+        description: TRUE for a fork (ForkEvent).
+      - name: is_push
+        description: TRUE for a push (PushEvent).
+      - name: is_pr_opened
+        description: TRUE when a pull request was opened.
+      - name: is_pr_merged
+        description: TRUE when a pull request was merged (action merged, or closed with merged = true before ~Oct 2025).
+      - name: is_issue_opened
+        description: TRUE when an issue was opened.
+
+  - name: agg_repo_daily
+    description: >
+      Daily activity per repository, bots excluded. One row per repo_id x event_date with at least one
+      human event. Partitioned by event_date; incremental insert_overwrite.
+    data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns: [event_date, repo_id]
+    columns:
+      - name: event_date
+        description: UTC day (partition column).
+        data_tests: [not_null]
+      - name: repo_id
+        description: Foreign key to dim_repo.
+        data_tests: [not_null]
+      - name: stars
+        description: Stars received (WatchEvent, action started).
+      - name: forks
+        description: Forks created.
+      - name: pushes
+        description: Push events (not commits; commit counts are no longer published upstream).
+      - name: prs_opened
+        description: Pull requests opened.
+      - name: prs_merged
+        description: Pull requests merged.
+      - name: issues_opened
+        description: Issues opened.
+      - name: unique_actors
+        description: Distinct human accounts active on the repo that day.
+      - name: events
+        description: All human events on the repo that day, any type.
+
+unit_tests:
+  - name: test_is_bot_flags_apps_and_known_bots_only
+    description: >
+      is_bot must flag GitHub Apps ("[bot]" suffix) and seeded service accounts, case-insensitively,
+      and must NOT flag a human whose login merely ends in "bot".
+    model: dim_actor
+    overrides:
+      macros:
+        is_incremental: false # test the first-build path; the flag logic is the same in both
+    given:
+      - input: ref('int_events_enriched')
+        rows:
+          - { actor_id: 1, actor_login: "dependabot[bot]", created_at: "2026-10-01 10:00:00" }
+          - { actor_id: 2, actor_login: "COPILOT", created_at: "2026-10-01 10:00:00" }
+          - { actor_id: 3, actor_login: "abbot", created_at: "2026-10-01 10:00:00" }
+          - { actor_id: 4, actor_login: "octocat", created_at: "2026-10-01 10:00:00" }
+      - input: ref('known_bots')
+        rows:
+          - { login: "copilot", reason: "test" }
+    expect:
+      rows:
+        - { actor_id: 1, is_bot: true }
+        - { actor_id: 2, is_bot: true }
+        - { actor_id: 3, is_bot: false }
+        - { actor_id: 4, is_bot: false }
