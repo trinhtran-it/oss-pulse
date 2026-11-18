@@ -109,6 +109,46 @@ make spark-dataproc DATE=2026-10-01   # gs:// → gs:// on Dataproc Serverless
 
 **Why Dataproc Serverless:** no cluster to create, size or remember to delete; you pay only while the batch runs. It runs as the `oss-pulse-pipeline` service account, inside `oss-pulse-subnet` (Private Google Access, no public IPs), both created by Terraform.
 
+## Warehouse (BigQuery raw.events)
+
+[warehouse/ddl/events.sql](warehouse/ddl/events.sql) defines `oss_pulse_raw.events`: 24 columns matching the Spark output, **partitioned by `DATE(created_at)`**, **clustered by `event_type, repo_name`**, with `require_partition_filter = TRUE`.
+
+```bash
+make bq-table                                        # create the table (idempotent DDL)
+make bq-load DATES="2026-10-01 2026-10-02"           # replace those daily partitions
+make bq-cost-demo DATES="2026-10-01 2026-10-02 2026-10-03" COST_DAY=2026-10-02
+```
+
+[warehouse/load_events.sh](warehouse/load_events.sh) loads one day at a time:
+1. It refuses to load unless `processed/events/dt=<date>/_SUCCESS` exists, so a half-written Spark output is never loaded.
+2. It runs `bq load --replace` into `events$YYYYMMDD`. The load job **atomically replaces that one partition**, so re-runs are idempotent and other days are untouched. BigQuery rejects the load if any row belongs to another date.
+3. It fails if the partition ends up empty.
+
+Loaded so far: 2026-10-01 (2,073,815 rows), 2026-10-02 (2,040,989) and 2026-10-03 (1,954,722). Each count matches Spark's `output_rows` exactly.
+
+The table is created by DDL, not Terraform. Terraform owns the datasets and IAM; the table schema changes together with the Spark code. This also avoids Terraform replacing (and emptying) the table on some schema changes.
+
+### Partitioning & clustering rationale
+
+Every question this project asks is bounded in time: daily dashboards, dbt models built one day at a time, "stars this week". So the table is **partitioned by `DATE(created_at)`** (UTC). A query for one day reads one partition instead of the whole history, and the daily load can replace exactly one partition, which makes it idempotent. At about 365 partitions a year it stays far below BigQuery's 10,000-partition limit. `require_partition_filter = TRUE` turns this into a guardrail: a query without a `created_at` filter is rejected instead of silently scanning every day ever loaded.
+
+Within a day, almost every metric starts from **one event type** (stars = `WatchEvent`, PRs = `PullRequestEvent`). `event_type` has only 16 values and is very skewed: across 2026-10-01 to 10-03, `WatchEvent` was 0.64% of rows and `PushEvent` 73.9%. Clustering on it **first** lets BigQuery skip almost every storage block for those queries. `repo_name` comes **second** for repo drill-downs (`WHERE repo_name = 'owner/name'`); clustering columns work like a sort order, so it only helps after `event_type` or on its own. Actor columns aren't clustered because queries rarely filter by them.
+
+**Measured result** (3 days loaded, question: top 10 starred repos on 2026-10-02, cache off):
+
+![BigQuery cost before/after](docs/bq_cost_before_after.png)
+
+| Query | Bytes processed | Bytes billed |
+|---|---|---|
+| A: unpartitioned copy, no filter | 168.5 MB | 168.8 MB |
+| B: unpartitioned copy, **same SQL as C** | 290.7 MB | 291.5 MB |
+| C: `raw.events`, partitioned + clustered | **0.9 MB** (−99.7% vs B) | 10.5 MB (BigQuery's 10 MB minimum per query) |
+
+- On an unpartitioned table, filters make a query *more* expensive (B > A): BigQuery also has to read `created_at` and `event_type` and can't skip anything.
+- Partitioning alone would cut B to roughly one third (one of three days). Clustering on `event_type` did the rest.
+- A dry run is an upper bound on bytes *processed*: a real job can prune more at run time, never less (billing still rounds up to the 10 MB minimum). Here, with a constant filter on the clustering column, the dry run already matched the real job (894,086 bytes). When the filter value comes from a subquery (`event_type IN (SELECT 'WatchEvent')`), BigQuery could not prune blocks at all: 97.7 MB, about 109× more. Filter clustered columns with constants or query parameters. `cost_demo.sh` still reports real job statistics, not estimates.
+- The numbers and job IDs are in [docs/bq_cost_results.json](docs/bq_cost_results.json); [warehouse/plot_cost.py](warehouse/plot_cost.py) draws the chart from that file.
+
 ## How to run
 ```bash
 cp .env.example .env   # fill in values

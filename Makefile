@@ -1,4 +1,4 @@
-.PHONY: setup up down backfill test lint ingest ingest-image ingest-docker spark-local spark-dataproc tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
+.PHONY: setup up down backfill test lint ingest ingest-image ingest-docker spark-local spark-dataproc bq-table bq-load bq-cost-demo bq-cost-chart tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
 
 # Load local settings (GCP_PROJECT_ID, GCP_REGION, TF_STATE_BUCKET, ...) if present.
 -include .env
@@ -52,7 +52,8 @@ ingest-docker: ingest-image
 LOCAL_INPUT      ?= data/sample/$(DATE)-*.json.gz
 DATAPROC_SA      ?= oss-pulse-pipeline@$(GCP_PROJECT_ID).iam.gserviceaccount.com
 DATAPROC_SUBNET  ?= oss-pulse-subnet
-DATAPROC_RUNTIME ?= 2.2  # Spark 3.5 (verified 2026-11-17); local tests also run Spark 4.x
+# Runtime 2.2 = Spark 3.5 (verified 2026-11-17); local tests also run Spark 4.x.
+DATAPROC_RUNTIME ?= 2.2
 
 spark-local:
 	.venv/bin/python spark/flatten_events.py --date $(DATE) \
@@ -70,6 +71,28 @@ spark-dataproc:
 		-- --date $(DATE) \
 		--input gs://$(GCS_BUCKET)/raw/gharchive/dt=$(DATE)/ \
 		--output gs://$(GCS_BUCKET)/processed/events
+
+# --- BigQuery: processed/events -> raw.events ----------------------------------
+# make bq-table                                  # create raw.events (idempotent DDL)
+# make bq-load DATES="2026-10-01 2026-10-02"     # replace those daily partitions
+# make bq-cost-demo DATES="2026-10-01 2026-10-02 2026-10-03" COST_DAY=2026-10-02
+DATES    ?= $(DATE)
+COST_DAY ?= $(lastword $(DATES))
+BQ       := bq --quiet --headless --project_id=$(GCP_PROJECT_ID) --location=$(GCP_REGION)
+
+bq-table:
+	$(BQ) --dataset_id=$(GCP_PROJECT_ID):$(BQ_DATASET_RAW) query --use_legacy_sql=false \
+		< warehouse/ddl/events.sql
+
+bq-load:
+	warehouse/load_events.sh $(DATES)
+
+bq-cost-demo:
+	warehouse/cost_demo.sh $(COST_DAY) $(DATES)
+	.venv/bin/python warehouse/plot_cost.py
+
+bq-cost-chart:
+	.venv/bin/python warehouse/plot_cost.py
 
 # --- Terraform -----------------------------------------------------------------
 

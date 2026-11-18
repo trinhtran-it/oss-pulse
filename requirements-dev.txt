@@ -1,4 +1,5 @@
 -r ingestion/requirements.txt
 -r spark/requirements.txt
+matplotlib>=3.8,<4  # warehouse/plot_cost.py
 pytest>=8,<9
 ruff>=0.6

@@ -1,0 +1,31 @@
+{
+  "cost_day": "2026-10-02",
+  "days_loaded": [
+    "2026-10-01",
+    "2026-10-02",
+    "2026-10-03"
+  ],
+  "queries": [
+    {
+      "key": "A",
+      "label": "Unpartitioned, no filter",
+      "job_id": "oss_pulse_cost_a_1794905347",
+      "bytes_processed": 168537824,
+      "bytes_billed": 168820736
+    },
+    {
+      "key": "B",
+      "label": "Unpartitioned, date + type filter",
+      "job_id": "oss_pulse_cost_b_1794905352",
+      "bytes_processed": 290693016,
+      "bytes_billed": 291504128
+    },
+    {
+      "key": "C",
+      "label": "Partitioned + clustered, same filter",
+      "job_id": "oss_pulse_cost_c_1794905356",
+      "bytes_processed": 894086,
+      "bytes_billed": 10485760
+    }
+  ]
+}
