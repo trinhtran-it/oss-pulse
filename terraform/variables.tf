@@ -59,6 +59,12 @@ variable "bq_dataset_marts" {
   default     = "oss_pulse_marts"
 }
 
+variable "bq_dataset_audit" {
+  description = "Dataset for the pipeline audit log (load_log)."
+  type        = string
+  default     = "oss_pulse_audit"
+}
+
 variable "dataproc_subnet_cidr" {
   description = "IP range of the subnet used by Dataproc Serverless batches."
   type        = string

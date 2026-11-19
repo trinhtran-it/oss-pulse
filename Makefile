@@ -1,4 +1,4 @@
-.PHONY: setup up down backfill test lint ingest ingest-image ingest-docker spark-local spark-dataproc bq-table bq-load bq-cost-demo bq-cost-chart dbt-deps dbt-debug dbt-build dbt-test dbt-freshness dbt-docs tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
+.PHONY: setup test lint up down airflow-build airflow-check airflow-trigger backfill chaos-test spark-upload bq-audit-table ingest ingest-image ingest-docker spark-local spark-dataproc bq-table bq-load bq-cost-demo bq-cost-chart dbt-deps dbt-debug dbt-build dbt-test dbt-freshness dbt-docs tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output
 
 # Load local settings (GCP_PROJECT_ID, GCP_REGION, TF_STATE_BUCKET, ...) if present.
 -include .env
@@ -12,22 +12,47 @@ END   ?= $(START)
 setup:
 	python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
-up:
-	docker compose -f airflow/docker-compose.yml up -d
-
-down:
-	docker compose -f airflow/docker-compose.yml down
-
-backfill:
-	docker compose -f airflow/docker-compose.yml exec airflow-scheduler \
-		airflow dags backfill oss_pulse_daily -s $(START) -e $(END)
-
 test:
 	.venv/bin/pytest
 
 lint:
 	.venv/bin/ruff check .
 	.venv/bin/ruff format --check .
+
+# --- Airflow 3 (official docker-compose + our image) -----------------------------------
+# make airflow-build && make up       # UI: http://localhost:8080 (airflow / airflow)
+# make backfill START=2026-10-01 END=2026-10-31   # (re)create runs; DAG must be unpaused
+# make chaos-test DAY=2026-10-15      # clear one finished day, re-run, compare counts
+COMPOSE := docker compose -f airflow/docker-compose.yaml --env-file .env
+AIRFLOW := $(COMPOSE) exec -T airflow-scheduler airflow
+DAY     ?= $(START)
+
+airflow-build:
+	$(COMPOSE) build
+
+# dbt_packages/ is mounted from the host, so install packages first.
+up: dbt-deps
+	$(COMPOSE) up -d --wait
+
+down:
+	$(COMPOSE) down
+
+# Fails if any DAG has an import error (parsed inside the real Airflow image).
+airflow-check:
+	$(AIRFLOW) dags reserialize
+	$(AIRFLOW) dags list-import-errors -o plain | tee /dev/stderr | grep -q "No data found"
+	$(AIRFLOW) dags list -o plain | grep oss_pulse_daily
+
+airflow-trigger:
+	$(AIRFLOW) dags trigger oss_pulse_daily --logical-date $(DAY)T00:00:00+00:00
+
+# --reprocess-behavior failed: create missing days AND re-run failed ones.
+backfill:
+	$(AIRFLOW) backfill create --dag-id oss_pulse_daily --from-date $(START) --to-date $(END) \
+		--reprocess-behavior failed
+
+chaos-test:
+	airflow/chaos_rerun.sh $(DAY)
 
 # --- Ingestion (GH Archive -> GCS raw) ------------------------------------------
 # make ingest DATE=2026-10-01 [HOURS=0-23] [ARGS="--force"]
@@ -54,6 +79,10 @@ DATAPROC_SA      ?= oss-pulse-pipeline@$(GCP_PROJECT_ID).iam.gserviceaccount.com
 DATAPROC_SUBNET  ?= oss-pulse-subnet
 # Runtime 2.2 = Spark 3.5 (verified 2026-11-17); local tests also run Spark 4.x.
 DATAPROC_RUNTIME ?= 2.2
+
+# The DAG runs gs://$GCS_BUCKET/code/spark/flatten_events.py: re-upload after changing the job.
+spark-upload:
+	gcloud storage cp spark/flatten_events.py gs://$(GCS_BUCKET)/code/spark/flatten_events.py
 
 spark-local:
 	.venv/bin/python spark/flatten_events.py --date $(DATE) \
@@ -83,6 +112,10 @@ BQ       := bq --quiet --headless --project_id=$(GCP_PROJECT_ID) --location=$(GC
 bq-table:
 	$(BQ) --dataset_id=$(GCP_PROJECT_ID):$(BQ_DATASET_RAW) query --use_legacy_sql=false \
 		< warehouse/ddl/events.sql
+
+bq-audit-table:
+	$(BQ) --dataset_id=$(GCP_PROJECT_ID):$(BQ_DATASET_AUDIT) query --use_legacy_sql=false \
+		< warehouse/ddl/load_log.sql
 
 bq-load:
 	warehouse/load_events.sh $(DATES)

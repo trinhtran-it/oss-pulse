@@ -23,6 +23,27 @@ jobs:
       - name: build ingestion image
         run: docker build -f ingestion/Dockerfile -t oss-pulse-ingestion .
 
+  airflow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build Airflow image
+        run: docker build -f airflow/Dockerfile -t oss-pulse-airflow:ci .
+      # Import every DAG in the real image (no metadata DB, no GCP). PYTHONPATH mirrors what
+      # Airflow does for the dags/ folder; config values are placeholders.
+      - name: DAGs import without errors
+        run: |
+          docker run --rm --entrypoint python \
+            -e PYTHONPATH=/opt/airflow/dags \
+            -e GCP_PROJECT_ID=ci-placeholder -e GCP_REGION=us-central1 -e GCS_BUCKET=ci-placeholder \
+            -v "$PWD/airflow/dags:/opt/airflow/dags:ro" oss-pulse-airflow:ci -c "
+          from airflow.dag_processing.dagbag import DagBag
+          bag = DagBag('/opt/airflow/dags')
+          assert not bag.import_errors, bag.import_errors
+          assert 'oss_pulse_daily' in bag.dags, sorted(bag.dags)
+          print('DAGs OK:', sorted(bag.dags))
+          "
+
   dbt:
     runs-on: ubuntu-latest
     needs: python

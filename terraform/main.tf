@@ -33,6 +33,7 @@ locals {
     raw     = { id = var.bq_dataset_raw, description = "Raw GH Archive events loaded from GCS (Spark output)." }
     staging = { id = var.bq_dataset_staging, description = "dbt staging models and seeds." }
     marts   = { id = var.bq_dataset_marts, description = "dbt marts consumed by the dashboard." }
+    audit   = { id = var.bq_dataset_audit, description = "Pipeline audit log: one row per Airflow run (load_log)." }
   }
 }
 
@@ -106,7 +107,7 @@ resource "google_storage_bucket_iam_member" "pipeline_lake_object_admin" {
   member = google_service_account.pipeline.member
 }
 
-# Read/write tables in the three project datasets only (not project-wide).
+# Read/write tables in the project datasets only (not project-wide).
 resource "google_bigquery_dataset_iam_member" "pipeline_data_editor" {
   for_each = google_bigquery_dataset.this
 

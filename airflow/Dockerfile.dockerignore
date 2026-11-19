@@ -1,0 +1,5 @@
+# Build context for airflow/Dockerfile is the repo root: send only the two requirements files
+# (keeps .env, data/, terraform state and .venv out of the build).
+**
+!ingestion/requirements.txt
+!dbt/requirements.txt

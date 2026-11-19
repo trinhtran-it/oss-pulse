@@ -31,7 +31,17 @@ Findings from profiling sample hours on 2026-11-12. The numbers come from single
 | ~Oct 2025 to mid-2026 | ~147k events, ~20–40 MB gz | ~3.5M events, ~0.5–0.9 GB gz |
 | Now (Nov 2026) | ~3.3–3.5k events, ~3.5 MB gz, ~13 MB raw | **~80–85k events, ~85 MB gz, ~315 MB raw** |
 
-- Volume dropped about **25×** between **2026-10-01** (85.6k events/hour, 76% of them `PushEvent`) and **2026-11-03** (3.5k/hour), mainly because push, create and delete events disappeared. The exact day isn't known.
+- Volume dropped about **25×** between **2026-10-01** (85.6k events/hour, 76% of them `PushEvent`) and **2026-11-03** (3.5k/hour), mainly because push, create and delete events disappeared.
+- **October 2026 backfill (all 31 days, 30.0M events):** the push/create/delete feed was **intermittent before it stopped**. Other event types were steady every day: 4–16k stars and 22–92k PR events.
+
+  | Days | Events/day | Push, Create, Delete |
+  |---|---|---|
+  | 10-01 … 10-06, 10-08 … 10-14, 10-19 … 10-22, 10-24 … 10-26 | 0.6–2.1M | present (~70–78% of events) |
+  | 10-07, 10-15 … 10-17 | 111–163k | **none** |
+  | 10-18, 10-23 | 377k, 122k | partial |
+  | **10-27 onward** | 81–108k | **none** (also none in the 2026-11-03 sample) |
+
+  Every one of these days had all 24 hourly files, so it's a **source-side gap, not a pipeline error**. The pipeline passed all its tests; nothing currently detects it.
 - Some hours are tiny and look **partial** (e.g. `2025-10-09-15` is 479 KB and `2026-09-01-15` is 1.7 MB, against a normal 20–100 MB). See the data-quality section.
 - **Implication:** a full 2025 backfill is about 1.3B events. A day of current data fits easily on one machine. Choose the backfill window on purpose: it largely determines both cost and how comparable the metrics are over time.
 
@@ -94,7 +104,7 @@ Keep these rules in one dbt model (`int_events_classified`) instead of repeating
 **Missing `PushEvent` fields and payload changes**
 - Around early Oct 2025 (when hourly file size fell ~3× with the same event count), `PushEvent` payloads **lost `commits`, `size` and `distinct_size`**. Only `before`, `head`, `push_id`, `ref` and `repository_id` remain.
 - In the same change, `PullRequestEvent.payload.pull_request` was cut down to `base, head, id, number, url`. `merged`, `title`, `user`, `additions` and the rest are gone, and a new `merged` action replaces the old `closed + merged` check.
-- By Nov 2026, `PushEvent`, `CreateEvent` and `DeleteEvent` **don't appear at all**.
+- `PushEvent`, `CreateEvent` and `DeleteEvent` drop out on some October 2026 days and are **gone from 2026-10-27 onward** (see Volume).
 - Mitigation: version metric logic by era, keep `payload_json`, and show the eras on the dashboard (a note or reference line) so readers don't mistake an upstream change for a real trend.
 
 **Time zones**

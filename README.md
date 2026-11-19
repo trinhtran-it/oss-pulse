@@ -189,12 +189,69 @@ make dbt-docs                                    # target/static_index.html
 
 **Breaking it on purpose:** a duplicate event made `dbt build` fail and **skip** `agg_repo_daily`, so the bad data never reached the dashboard. Re-running the day fixed it. Write-up: [docs/DEVLOG.md](docs/DEVLOG.md).
 
+## Orchestration (Airflow 3)
+
+[airflow/dags/oss_pulse_daily.py](airflow/dags/oss_pulse_daily.py) runs the whole pipeline for one UTC day per run:
+
+```
+ingest_raw → spark_flatten → load_bq_partition → dbt_source_freshness → dbt_build → record_audit
+```
+
+| Task | How it runs | Why it is safe to re-run |
+|---|---|---|
+| `ingest_raw` | `BashOperator` → `python -m ingestion.gharchive --date {{ ds }}` | Skips hours already in GCS with the same size |
+| `spark_flatten` | `DataprocCreateBatchOperator` (deferrable) runs the uploaded `flatten_events.py` | Overwrites `processed/events/dt=<ds>/`; a new batch ID per attempt |
+| `load_bq_partition` | Python task: check `_SUCCESS`, then a load job into `raw.events$<ds_nodash>` | `WRITE_TRUNCATE` on one partition is atomic |
+| `dbt_source_freshness` | `dbt source freshness`, only when the day is recent (see below) | Read-only |
+| `dbt_build` | `dbt build --target prod --vars '{run_date: <ds>}'` | `insert_overwrite` and `merge` |
+| `record_audit` | Python task, `trigger_rule=all_done` → `oss_pulse_audit.load_log` | Append-only: one row per attempt |
+
+**Scheduling.**
+- `start_date=2026-10-01`, `catchup=True`, `max_active_runs=2`. Retries: 3, backed off at 5 → 10 → 20 min. Every task has an `execution_timeout`.
+- Dates come only from `{{ ds }}` / `{{ ds_nodash }}`.
+- The schedule is `CronDataIntervalTimetable("@daily")`. In Airflow 3, a plain `"@daily"` is a cron *trigger*: the run for 10-01 would start at 10-01 00:00, before that day's data exists. The interval timetable starts it after 10-02 00:00.
+
+**Design decisions:**
+- **Only one dbt build at a time.** `dbt_build` has `max_active_tis_per_dag=1`. Two days can ingest and load in parallel, but only one dbt build runs at a time, because two builds would collide on the same temp tables and dimension `MERGE`s. Date order isn't needed: fact and aggregate partitions are independent, and the dims keep min/max timestamps and the name with the newer `last_seen_at`. I first used `depends_on_past=True`, but it **deadlocked** when I re-ran an old failed day: that run waited for a free slot, and the two newer runs' dbt waited for it.
+- **Only one Spark batch at a time.** Each Dataproc batch needs 12 vCPUs, and the project quota (`CPUS_ALL_REGIONS`) is 16, so a second concurrent batch is rejected. `spark_flatten` has `max_active_tis_per_dag=1`, which also counts deferred tasks. It retries every 2 min, because Dataproc releases the vCPUs a little after a batch reports SUCCEEDED. Raising the quota to 24+ would let two days run Spark in parallel.
+- **Freshness vs. backfills.** Freshness compares data with *now*, so for a backfilled October day it would always report "stale". The task only runs the check when the day ended less than 2 days ago; otherwise it logs a skip. This is the only place the wall clock is used.
+- **The audit records failures too.** `record_audit` runs even when an upstream task failed, writes `status=failed` and the failed task names, then fails itself. It is the DAG's only leaf, so otherwise a failed pipeline would show a green run.
+- **Alerts.** [alerts.py](airflow/dags/oss_pulse_lib/alerts.py) is the `on_failure_callback`. It posts to a Slack webhook taken from the Airflow Variable `slack_webhook_secret`, which you set as `AIRFLOW_VAR_SLACK_WEBHOOK_SECRET` in `.env`. It fires once per task after the last retry; without a webhook it only logs. A failed run sends one alert, not two.
+- **Credentials.** Your ADC file is mounted read-only from outside the repo. It is not in the DAG, the image or Git.
+
+**Docker setup.**
+- [docker-compose.yaml](airflow/docker-compose.yaml) is the official Airflow 3.4.0 file. Every change is marked `oss-pulse:`.
+- [Dockerfile](airflow/Dockerfile) extends the official image with the ingestion dependencies, plus dbt in its own venv so its pins don't conflict with Airflow's.
+- Code is mounted, not baked in, so edits don't need a rebuild.
+- The UI is published on `127.0.0.1` only.
+
+```bash
+make airflow-build && make up        # UI: http://localhost:8080 (airflow / airflow)
+make spark-upload                    # after changing spark/flatten_events.py
+make bq-audit-table                  # once: creates oss_pulse_audit.load_log
+make airflow-check                   # DAG imports cleanly inside the real image (also in CI)
+make backfill START=2026-10-01 END=2026-10-31   # re-run missing/failed days (DAG must be unpaused)
+make chaos-test DAY=2026-10-15       # clear a finished day, re-run it, compare counts
+```
+
+**Results: October 2026 backfill (catchup, 31 runs).**
+
+| Check | Result |
+|---|---|
+| Runs | **31/31 success**; `OSS_PULSE_END_DATE=2026-10-31` stopped catchup there |
+| Rows | **30,008,428** in `raw.events` = 30,008,428 in `fct_events`; audit `rows_loaded` matches `raw.events` on all 31 days; 0 duplicate `event_id`s |
+| Audit trail | 34 rows: one `success` per day, 2 earlier `failed` attempts (10-08 and 10-10, see DEVLOG) and the chaos test's second `success` for 10-15 |
+| Chaos test (2026-10-15) | Cleared and re-run in 4 min: `raw.events`, `fct_events` (the day and its lookback day) and `agg_repo_daily` counts identical before and after |
+| Failure alert | Smoke-tested in Airflow 3.4: the Variable is read through the Execution API and the message is posted |
+| Cost (measured) | Dataproc 9.5 DCU-hours (35 successful batches; the 23 quota-rejected submits never started, so they cost nothing) · BigQuery 118 GB billed in 2,001 query jobs, inside the 1 TB free tier · GCS 17.8 GiB (7.4 raw + 10.5 Parquet) |
+
+The backfill also showed that GH Archive's push/create/delete feed was **intermittent in October and stopped on 2026-10-27**, while stars and PRs stayed steady ([DATA_NOTES](docs/DATA_NOTES.md#volume)). Daily totals and push counts are therefore not comparable across October.
+
 ## How to run
 ```bash
 cp .env.example .env   # fill in values
 make setup             # install deps
-make up                # start Airflow locally
-make backfill START=2026-01-01 END=2026-01-07
+make airflow-build && make up   # start Airflow locally
 make test lint
 make down
 ```

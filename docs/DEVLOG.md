@@ -2,6 +2,42 @@
 
 Short entries on things that broke, surprised me, or changed a decision. Newest first.
 
+## 2026-11-19: The October backfill found a gap in the source, not in the pipeline
+
+All 31 days loaded and passed every test. But 2026-10-07 had only 162k events, against 1.5–2.1M on the days around it. All 24 hourly files were present. Grouping by event type showed what happened:
+
+| Days | Events/day | Push, Create, Delete | Stars, PRs |
+|---|---|---|---|
+| Most days to 10-26 | 0.6–2.1M | present (~75% of events) | steady |
+| 10-07, 10-15 … 10-17 | 111–163k | **none** | steady |
+| 10-18, 10-23 | 377k, 122k | partial | steady |
+| 10-27 onward | 81–108k | **none** | steady |
+
+GH Archive's push/create/delete feed was intermittent for three weeks and then stopped. My earlier notes only said it disappeared "somewhere between 10-01 and 11-03".
+
+**Why it matters.** The pipeline was right to load what the source had, but a dashboard would show "pushes = 0 on 10-07" as if nobody pushed that day. None of my tests could catch it. They check keys, relationships and accepted values, not whether a day looks normal.
+
+**What I'd add.** A volume check per event type: warn when a type that existed the day before has zero rows, or when the daily count is below ~20% of the trailing 7-day median. It would run as a dbt test on `agg_repo_daily` or as a check after `load_bq_partition`. On the dashboard, push metrics should be labelled as unreliable for October 2026.
+
+## 2026-11-18: A laptop is not a scheduler (sleep, heartbeats, and a deadlock)
+
+The backfill ran overnight on my Mac. By morning 9 of 31 days were done, and dbt for 10-08 and 10-10 had "failed" four times each. Yet every dbt attempt log ended with `Done. PASS=41 ERROR=0`.
+
+**What happened.** The Mac slept on battery (`caffeinate -s` only blocks sleep on AC power). Containers froze and tasks stopped sending heartbeats for 16–28 minutes. The scheduler logged `Detected a task instance without a heartbeat`, failed the attempt and started a retry. When the frozen dbt woke up and finished, its auth token was already revoked (`403 Invalid auth token`). Other attempts failed on dropped connections (`SSLEOFError`, `BrokenPipe`, `ReadTimeout`). No data was wrong: every step is idempotent, and GCS only publishes an object once its upload completes.
+
+**The real bug it exposed: `depends_on_past` deadlocked.** I re-ran the failed 10-08 run. It went to `queued`, waiting for one of the 2 run slots (`max_active_runs=2`). Both slots were held by 10-09 and 10-10, whose `dbt_build` waited for 10-08's `dbt_build` (`depends_on_past=True`). Nothing could move. I replaced it with `max_active_tis_per_dag=1`: still one dbt build at a time, but without the date order dbt never needed (fact partitions are independent, and the dims keep min/max timestamps and the newest name). After that, re-running an old day works while newer days carry on.
+
+**Lessons.**
+- A missed heartbeat looks exactly like a task failure. Production Airflow belongs on always-on infrastructure (Cloud Composer, a VM, Kubernetes), not on a laptop.
+- `depends_on_past` together with `max_active_runs > 1` can deadlock when you repair an old day. Use it only when work truly must be done in date order.
+- The audit table told the truth: 10-08 shows `failed`, then `success`.
+
+## 2026-11-18: Three Airflow 3 defaults that would have broken the daily run
+
+1. **`schedule="@daily"` is now a cron *trigger*.** Airflow 3 defaults to `create_cron_data_intervals=False`, so the run for `ds=2026-10-01` starts at 10-01 00:00, before any of that day's data exists. A backfill wouldn't notice, but every live run would ask GH Archive for hours not yet published. Fix: `CronDataIntervalTimetable("@daily")`. I only caught it because the scheduler log showed `data_interval start = end`.
+2. **`retry_exponential_backoff=True` no longer backs off.** In 3.4 it's a float multiplier, and `True` means 1.0: 5, 5, 5 minutes. Fix: `2.0`, giving 5, 10, 20 minutes.
+3. **The project's vCPU quota is 16, and one Dataproc batch needs 12.** With 2 runs active, the second batch failed with `Quota 'CPUS_ALL_REGIONS' exceeded`. Fix: `max_active_tis_per_dag=1` on `spark_flatten` (in 3.4 this also counts deferred tasks), plus short fixed retries, because Dataproc releases the vCPUs a few seconds *after* a batch reports SUCCEEDED.
+
 ## 2026-11-18: Breaking dbt on purpose with a duplicate event
 
 **Goal.** Prove that a duplicate row can't silently reach the dashboard.

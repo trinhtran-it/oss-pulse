@@ -18,5 +18,6 @@ known-third-party = ["airflow"]  # not the local airflow/ folder
 "ingestion/gharchive.py" = ["B904"]  # argparse/config errors intentionally re-raised with a clean message
 
 [tool.pytest.ini_options]
-testpaths = ["ingestion/tests", "spark/tests"]
+testpaths = ["ingestion/tests", "spark/tests", "airflow/tests"]
+pythonpath = ["airflow/dags"]  # import oss_pulse_lib like Airflow does
 addopts = "-q"

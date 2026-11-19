@@ -10,6 +10,8 @@ dbt/oss_pulse/target/
 dbt/oss_pulse/dbt_packages/
 dbt/oss_pulse/logs/
 airflow/logs/
+airflow/config/
+airflow/plugins/
 
 .bruin.yml
 # Terraform: real values stay local (commit the *.example files)
