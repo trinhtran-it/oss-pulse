@@ -184,6 +184,72 @@ models:
       - name: events
         description: All human events on the repo that day, any type.
 
+  - name: agg_events_hourly
+    description: >
+      Event counts per UTC day x hour x event_type x is_bot, bots included and flagged.
+      Small reporting table for the dashboard (category, time-series and heatmap tiles), so
+      dashboard queries never scan fct_events. Partitioned by event_date; incremental insert_overwrite.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_date, event_hour, event_type, is_bot]
+    columns:
+      - name: event_date
+        description: UTC day (partition column).
+        data_tests: [not_null]
+      - name: event_hour
+        description: UTC hour (0-23).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+                quote: false
+      - name: weekday
+        description: ISO weekday of event_date as sortable text, '1 Mon' ... '7 Sun'.
+        data_tests: [not_null]
+      - name: event_type
+        description: GitHub event type.
+        data_tests: [not_null]
+      - name: event_category
+        description: Reporting group from seeds/event_type_lookup.csv.
+        data_tests: [not_null]
+      - name: is_bot
+        description: TRUE for events by bots (macros/is_bot.sql). Filter it out for human activity.
+        data_tests: [not_null]
+      - name: events
+        description: Number of events.
+        data_tests: [not_null]
+
+  - name: rpt_top_repos_7d
+    description: >
+      Top 10 repositories by stars over the 7 most recent loaded days (bots excluded), with names
+      from dim_repo. Rebuilt on every run. The window ends at the latest day in agg_repo_daily, not
+      at today, so it stays filled when the pipeline is paused or backfilling.
+    columns:
+      - name: stars_rank
+        description: 1 = most stars in the window. Ties broken by repo_id.
+        data_tests: [unique, not_null]
+      - name: repo_id
+        description: Foreign key to dim_repo.
+        data_tests: [unique, not_null]
+      - name: repo_name
+        description: owner/name at the most recent event.
+      - name: repo_url
+        description: https://github.com/<repo_name>.
+      - name: stars
+        description: Stars received in the window, bots excluded.
+      - name: forks
+        description: Forks created in the window.
+      - name: prs_merged
+        description: Pull requests merged in the window.
+      - name: events
+        description: All human events on the repo in the window.
+      - name: window_start
+        description: First day of the 7-day window (UTC).
+      - name: window_end
+        description: Last day of the 7-day window (UTC) = latest day loaded in agg_repo_daily.
+
 unit_tests:
   - name: test_is_bot_flags_apps_and_known_bots_only
     description: >

@@ -13,7 +13,7 @@ GH Archive (hourly .json.gz)
   → ingestion/gharchive.py  → GCS (raw)
   → spark/flatten_events.py → GCS (parquet) → BigQuery (raw)
   → dbt (staging → intermediate → marts)
-  → dashboard
+  → Looker Studio dashboard (marts only)
 Orchestrated by Airflow (airflow/dags/oss_pulse_daily.py); infra via Terraform.
 ```
 
@@ -164,6 +164,8 @@ Within a day, almost every metric starts from **one event type** (stars = `Watch
 | | `dim_repo` | incremental, `merge` | One row per `repo_id`: latest name/owner, first/last seen |
 | | `dim_actor` | incremental, `merge` | One row per `actor_id`: latest login, `is_bot`, first/last seen |
 | | `dim_date` | table | Calendar from `dbt_utils.date_spine` |
+| | `agg_events_hourly` | incremental, `insert_overwrite` | Day × hour × event type × `is_bot` counts (~18k rows/month); serves the dashboard |
+| | `rpt_top_repos_7d` | table | Top 10 repos by stars over the latest loaded week, with names; serves the dashboard |
 
 ```bash
 make dbt-deps && make dbt-debug
@@ -177,8 +179,8 @@ make dbt-docs                                    # target/static_index.html
 
 **Incremental design.** One macro, [event_window](dbt/oss_pulse/macros/event_window.sql), decides which days a run rebuilds: `run_date` minus `lookback_days` up to `run_date`, or all history on a first build. Its bounds are constants, so BigQuery prunes partitions and `raw.events`' required partition filter is satisfied. The fact and aggregate tables replace partitions with **copy jobs** (`copy_partitions: true`), which cut a 2-day run from 987 MB to 333 MB processed. Re-running a day replaces it, so runs are idempotent (tested: identical row counts).
 
-**Tests (41 per build, all passing):**
-- `unique` + `not_null` on every primary key, and `unique_combination_of_columns` for `agg_repo_daily`.
+**Tests (45 per build, all passing):**
+- `unique` + `not_null` on every primary key, and `unique_combination_of_columns` for `agg_repo_daily` and `agg_events_hourly`.
 - `relationships` from `fct_events` to `dim_repo`, `dim_actor` and `dim_date`.
 - `accepted_values` on `event_type`, with all 16 types.
 - A singular test, [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql).
@@ -247,6 +249,16 @@ make chaos-test DAY=2026-10-15       # clear a finished day, re-run it, compare 
 
 The backfill also showed that GH Archive's push/create/delete feed was **intermittent in October and stopped on 2026-10-27**, while stars and PRs stayed steady ([DATA_NOTES](docs/DATA_NOTES.md#volume)). Daily totals and push counts are therefore not comparable across October.
 
+## Dashboard (Looker Studio)
+
+![dashboard](docs/dashboard.png)
+
+**Live report:** [Looker Studio](https://datastudio.google.com/reporting/b792d5da-dff2-41cb-b080-cb675a64c5ca) (view-only, no sign-in needed).
+
+Four tiles: events by type, daily events by category, top 10 repos by stars over the latest week, and a weekday × hour heatmap of human activity. Plus a date-range control and a "how to read" note on the October source gap. Build spec, field setup and cost: [docs/DASHBOARD.md](docs/DASHBOARD.md).
+
+**It reads two small tables built for it, never `raw` and never the big marts.** Each chart refresh is a BigQuery query paid by the project. On `fct_events` the same tiles would scan ~1 GB per refresh. On `agg_events_hourly` (1 MB) and `rpt_top_repos_7d` (10 rows), every query stays at the 10 MB billing minimum.
+
 ## How to run
 ```bash
 cp .env.example .env   # fill in values
@@ -255,9 +267,6 @@ make airflow-build && make up   # start Airflow locally
 make test lint
 make down
 ```
-
-## Results
-![dashboard](docs/dashboard.png)
 
 ## Cost
 ![bq cost](docs/bq_cost_before_after.png)

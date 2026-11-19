@@ -2,6 +2,18 @@
 
 Short entries on things that broke, surprised me, or changed a decision. Newest first.
 
+## 2026-11-19: The dashboard was right, the first drafts were misleading
+
+The Looker Studio report reads two tables built for it (`agg_events_hourly`, 1 MB, and `rpt_top_repos_7d`, 10 rows) instead of `fct_events` (2.4 GB). Each chart refresh is a billed query, and on `fct_events` the same tiles would scan ~1 GB per refresh.
+
+Three review rounds before it was publishable. Each draft showed correct numbers that said the wrong thing:
+
+1. **Default date range.** A date control left on its default shows the *last 28 days*. For a pipeline that stopped at 10-31, every number covered Oct 22–31 only (4.55M events instead of 30.0M), with no error. Fix: a fixed default range.
+2. **One line instead of one per category.** Without a category breakdown, the source gap (push/create/delete missing) looked like GitHub activity collapsing. Broken down, only the "code" line drops.
+3. **A weekday heatmap from one month.** Fri/Sat looked busiest, but each weekday rests on 4–5 days and daily volume ranges 41k–163k: the busiest days (Oct 2–3) just happened to be a Friday and Saturday. One cell, Fri 16:00, stood far above the rest because of a single burst on Oct 23 (24.5k events in one hour from thousands of accounts, likely delayed events released at once). The heatmap stays, with a note to read hours, not weekdays.
+
+**Lesson.** Check a dashboard against the warehouse (every scorecard and a few cells matched BigQuery exactly). Then ask what a reader would conclude from it, because correct numbers can still lead to a wrong conclusion.
+
 ## 2026-11-19: The October backfill found a gap in the source, not in the pipeline
 
 All 31 days loaded and passed every test. But 2026-10-07 had only 162k events, against 1.5–2.1M on the days around it. All 24 hourly files were present. Grouping by event type showed what happened:

@@ -42,6 +42,8 @@ Findings from profiling sample hours on 2026-11-12. The numbers come from single
   | **10-27 onward** | 81–108k | **none** (also none in the 2026-11-03 sample) |
 
   Every one of these days had all 24 hourly files, so it's a **source-side gap, not a pipeline error**. The pipeline passed all its tests; nothing currently detects it.
+- **Other types also swing a lot from day to day.** Human events excluding push/create/delete ranged from **41k (10-25) to 163k (10-03)** per day; Oct 1–3 were 2–3× busier than mid-month. With one month of data, a weekday average rests on 4–5 days, so weekday comparisons are not reliable.
+- **One-hour burst: 2026-10-23 16:00 UTC.** 24,511 human events (excluding push/create/delete) against ~1.2–2.5k in the hours around it: 8.6k stars, 5.3k PR events, 4.1k issue events, 3.5k wiki edits, from thousands of different accounts (6.5k for the stars alone, on 5.7k repos). 15:00 and 17:00 were *below* normal, which suggests delayed events released at once by the source rather than real activity. Stars that day were 13.7k, about 2× a normal day. It shows up as the Friday 16:00 peak on the dashboard heatmap.
 - Some hours are tiny and look **partial** (e.g. `2025-10-09-15` is 479 KB and `2026-09-01-15` is 1.7 MB, against a normal 20–100 MB). See the data-quality section.
 - **Implication:** a full 2025 backfill is about 1.3B events. A day of current data fits easily on one machine. Choose the backfill window on purpose: it largely determines both cost and how comparable the metrics are over time.
 
