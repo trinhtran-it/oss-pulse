@@ -1,0 +1,87 @@
+// oss-pulse marts: star schema + reporting tables. Render: make diagrams  (-> docs/data_model.png)
+digraph data_model {
+  graph [rankdir=LR, fontname="Helvetica", pad=0.3, nodesep=0.35, ranksep=0.9, bgcolor="white"]
+  node  [shape=plain, fontname="Helvetica", fontsize=10]
+  edge  [fontname="Helvetica", fontsize=9, color="#52606D", arrowsize=0.7]
+
+  dim_date [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#7B8794" bgcolor="white">
+      <tr><td bgcolor="#E6F0FA" align="left"><b>dim_date</b></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">1 row per calendar day</font></td></tr>
+      <tr><td align="left" port="pk"><b>date_day</b>  PK</td></tr>
+      <tr><td align="left">year, quarter, month, month_name</td></tr>
+      <tr><td align="left">iso_week, day_of_week, day_name, is_weekend</td></tr>
+    </table>>]
+
+  dim_repo [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#7B8794" bgcolor="white">
+      <tr><td bgcolor="#E6F0FA" align="left"><b>dim_repo</b>  <font point-size="9">incremental merge</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">1 row per repository · 5.8M</font></td></tr>
+      <tr><td align="left" port="pk"><b>repo_id</b>  PK</td></tr>
+      <tr><td align="left">repo_name, repo_owner, repo_url (latest)</td></tr>
+      <tr><td align="left">first_seen_at, last_seen_at</td></tr>
+    </table>>]
+
+  dim_actor [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#7B8794" bgcolor="white">
+      <tr><td bgcolor="#E6F0FA" align="left"><b>dim_actor</b>  <font point-size="9">incremental merge</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">1 row per account · 3.6M</font></td></tr>
+      <tr><td align="left" port="pk"><b>actor_id</b>  PK</td></tr>
+      <tr><td align="left">actor_login (latest), is_bot</td></tr>
+      <tr><td align="left">first_seen_at, last_seen_at</td></tr>
+    </table>>]
+
+  fct_events [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#3F8F5A" bgcolor="white">
+      <tr><td bgcolor="#E8F5EC" align="left"><b>fct_events</b>  <font point-size="9">incremental insert_overwrite</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">1 row per GitHub event · 30.0M (Oct 2026)</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">partition event_date · cluster event_type, repo_id</font></td></tr>
+      <tr><td align="left"><b>event_id</b>  PK</td></tr>
+      <tr><td align="left" port="date">event_date  FK</td></tr>
+      <tr><td align="left" port="repo">repo_id  FK</td></tr>
+      <tr><td align="left" port="actor">actor_id  FK</td></tr>
+      <tr><td align="left">created_at, event_hour, event_type, event_category</td></tr>
+      <tr><td align="left">is_bot, org_id, payload_action, pr_number, issue_number</td></tr>
+      <tr><td align="left">is_star, is_fork, is_push, is_pr_opened, is_pr_merged, is_issue_opened</td></tr>
+    </table>>]
+
+  agg_repo_daily [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#B7791F" bgcolor="white">
+      <tr><td bgcolor="#FFF4E5" align="left"><b>agg_repo_daily</b>  <font point-size="9">insert_overwrite</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">1 row per repo × day, bots excluded · 9.1M</font></td></tr>
+      <tr><td align="left"><b>event_date, repo_id</b>  PK</td></tr>
+      <tr><td align="left">stars, forks, pushes, prs_opened, prs_merged</td></tr>
+      <tr><td align="left">issues_opened, unique_actors, events</td></tr>
+    </table>>]
+
+  agg_events_hourly [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#B7791F" bgcolor="white">
+      <tr><td bgcolor="#FFF4E5" align="left"><b>agg_events_hourly</b>  <font point-size="9">insert_overwrite</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">1 row per day × hour × event_type × is_bot · 18k</font></td></tr>
+      <tr><td align="left"><b>event_date, event_hour, event_type, is_bot</b>  PK</td></tr>
+      <tr><td align="left">weekday, event_category, events</td></tr>
+    </table>>]
+
+  rpt_top_repos_7d [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#B7791F" bgcolor="white">
+      <tr><td bgcolor="#FFF4E5" align="left"><b>rpt_top_repos_7d</b>  <font point-size="9">table, rebuilt daily</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">top 10 repos by stars, latest 7 loaded days</font></td></tr>
+      <tr><td align="left"><b>stars_rank</b>  PK</td></tr>
+      <tr><td align="left">repo_id, repo_name, repo_url</td></tr>
+      <tr><td align="left">stars, forks, prs_merged, events, window_start, window_end</td></tr>
+    </table>>]
+
+  // Star schema: foreign keys
+  fct_events:date  -> dim_date:pk  [label="many : 1"]
+  fct_events:repo  -> dim_repo:pk  [label="many : 1"]
+  fct_events:actor -> dim_actor:pk [label="many : 1"]
+
+  // Reporting tables, built from the fact (dashed = "aggregated from")
+  agg_repo_daily    -> fct_events [dir=back, style=dashed, color="#B7791F", label="aggregates"]
+  agg_events_hourly -> fct_events [dir=back, style=dashed, color="#B7791F", label="aggregates"]
+  rpt_top_repos_7d  -> agg_repo_daily [dir=back, style=dashed, color="#B7791F"]
+  rpt_top_repos_7d  -> dim_repo [style=dashed, color="#B7791F", label="names", constraint=false]
+
+  { rank=same; agg_repo_daily; agg_events_hourly }
+  { rank=same; dim_date; dim_repo; dim_actor }
+}

@@ -1,59 +1,106 @@
 # oss-pulse
 
-Daily analytics on open-source activity from [GH Archive](https://www.gharchive.org/).
+A daily batch pipeline that turns [GH Archive](https://www.gharchive.org/) (every public GitHub event, one gzip file per hour) into a tested BigQuery star schema and a public dashboard. It runs on Terraform-managed GCP resources, orchestrated by Airflow 3.
+
+**[Live dashboard](https://datastudio.google.com/reporting/b792d5da-dff2-41cb-b080-cb675a64c5ca)** · [How to run](#how-to-run) · [Cost](#cost) · [Dev log](docs/DEVLOG.md)
+
+![dashboard](docs/dashboard.png)
 
 ## Problem
-_TODO: what question does this answer, and for whom?_
+
+GitHub shows the activity of one repository at a time. It does not answer cross-repository questions such as "which projects are gaining attention this week?" or "how much of GitHub's activity is automated?". GH Archive has the raw data, millions of events a day as nested JSON, but nobody can query that directly. Teams that track open source (OSS program offices, developer relations, engineers choosing a dependency) need it cleaned, modeled and refreshed every day, with numbers they can trust.
+
+**Business questions** and where each one is answered:
+
+| # | Question | Answered by |
+|---|---|---|
+| 1 | Which repositories gained the most stars this week? | `rpt_top_repos_7d` → dashboard "Top 10 repos" |
+| 2 | What kinds of activity happen on GitHub, and how does the mix change day by day? | `agg_events_hourly` → "Events by type", "Daily events by category" |
+| 3 | When are human developers active (hour of day, UTC)? | `agg_events_hourly` → heatmap |
+| 4 | How much of the activity is bots? | `is_bot` on `dim_actor` / `fct_events` → "Bot share" (22.9% in Oct 2026) |
+| 5 | Is a given day complete and correct? | `oss_pulse_audit.load_log`, dbt tests, [DATA_NOTES](docs/DATA_NOTES.md) |
 
 ## Architecture
+
 ![architecture](docs/architecture.png)
 
-```
-GH Archive (hourly .json.gz)
-  → ingestion/gharchive.py  → GCS (raw)
-  → spark/flatten_events.py → GCS (parquet) → BigQuery (raw)
-  → dbt (staging → intermediate → marts)
-  → Looker Studio dashboard (marts only)
-Orchestrated by Airflow (airflow/dags/oss_pulse_daily.py); infra via Terraform.
-```
+One Airflow run processes one UTC day, and each step can be re-run safely:
 
-## Infrastructure (Terraform)
+1. **Ingest:** stream 24 hourly files from GH Archive into GCS `raw/`.
+2. **Process:** Spark on Dataproc Serverless flattens the JSON into typed Parquet, with quality gates.
+3. **Load:** replace that day's partition of `raw.events` in BigQuery.
+4. **Transform:** dbt checks freshness, builds staging → intermediate → marts, and tests them.
+5. **Audit:** record the run's outcome in `audit.load_log`.
+
+Looker Studio reads two small mart tables. The diagram source is [docs/diagrams/architecture.dot](docs/diagrams/architecture.dot) (`make diagrams`).
+
+## Tech stack
+
+| Layer | Tool | Why this one | Alternative considered |
+|---|---|---|---|
+| Cloud | **GCP** | BigQuery's free tier (1 TiB queries/month) and serverless Spark cover the whole project for about $2 | AWS (Athena/EMR): similar, more moving parts |
+| Infrastructure | **Terraform** | Bucket, datasets, service account, IAM and network are reviewable code; `terraform destroy` removes everything | Clicking in the console: not reproducible |
+| Ingestion | **Python** (`requests` + `google-cloud-storage`) | Streams HTTP into a GCS resumable upload with no local disk; small, fully unit-tested | Storage Transfer Service: no per-hour retries, exit codes or logging under my control |
+| Processing | **Spark on Dataproc Serverless** | Explicit schema for nested, drifting payloads; quality gates *before* the warehouse; no cluster to manage. 2025 volumes are 3.5M events/day, 1.3B a year | BigQuery `LOAD` of raw JSON + SQL: enough at today's ~100k events/day (see [Limitations](#limitations-and-future-improvements)) |
+| Warehouse | **BigQuery** | Serverless; day partitions and clustering make each daily query read megabytes, not gigabytes | Snowflake: no free tier |
+| Transformation | **dbt** | Tests that gate downstream models, incremental partition replacement, lineage and docs | Scheduled SQL: no tests or lineage |
+| Orchestration | **Airflow 3** (Docker Compose) | Data-interval scheduling, catchup/backfill, retries, deferrable Dataproc operator, failure callbacks | Cloud Composer: managed, but several hundred dollars a month even when idle; Dagster: also good, less common in job ads |
+| Dashboard | **Looker Studio** | Free, native BigQuery connector, shareable link | Metabase/Superset: needs hosting |
+| CI | **GitHub Actions** | ruff, pytest, image builds, dbt parse, DAG import check on every push | — |
+
+## Data model
+
+![data model](docs/data_model.png)
+
+A star schema in `oss_pulse_marts`, plus reporting tables built for the dashboard. Diagram source: [docs/diagrams/data_model.dot](docs/diagrams/data_model.dot).
+
+| Table | Grain (one row per …) | Build | Rows (Oct 2026) |
+|---|---|---|---|
+| `fct_events` | GitHub event | incremental `insert_overwrite`, partitioned by `event_date`, clustered by `event_type, repo_id` | 30.0M |
+| `dim_repo` | repository (`repo_id`, stable across renames) | incremental `merge`; latest name, first/last seen | 5.8M |
+| `dim_actor` | account (`actor_id`) | incremental `merge`; latest login, `is_bot` | 3.6M |
+| `dim_date` | calendar day | table (`dbt_utils.date_spine`) | 457 |
+| `agg_repo_daily` | repo × day, **bots excluded** | incremental `insert_overwrite` | 9.1M |
+| `agg_events_hourly` | day × hour × event type × `is_bot` | incremental `insert_overwrite` | 17.6k |
+| `rpt_top_repos_7d` | rank (top 10 repos by stars, latest 7 loaded days) | table, rebuilt daily | 10 |
+
+**Business rules live in one place,** [int_events_enriched](dbt/oss_pulse/models/intermediate/int_events_enriched.sql):
+- event category (from a seed);
+- the bot flag (macro + seed);
+- a star is a `WatchEvent` with action `started`;
+- a merged PR counts under both the old and the new payload format.
+
+Every mart counts from these flags. The data's quirks are documented in [DATA_NOTES](docs/DATA_NOTES.md).
+
+## Pipeline
+
+### Infrastructure (Terraform)
 
 Everything in GCP is defined in [terraform/](terraform/) except the state bucket.
 
 | Resource | Purpose |
 |---|---|
-| `google_storage_bucket.lake` | Data lake. Uniform bucket-level access, public access blocked, objects under `raw/` deleted after 90 days. `force_destroy` is enabled only when `environment = "dev"` |
-| `google_bigquery_dataset.this["raw"\|"staging"\|"marts"]` | `oss_pulse_raw` (loaded from GCS), `oss_pulse_staging` (dbt staging models and seeds), `oss_pulse_marts` (dbt marts) |
-| `google_service_account.pipeline` | `oss-pulse-pipeline`, the identity that runs ingestion, Spark, loads and dbt |
-| IAM | `storage.objectAdmin` on the **lake bucket only**, `bigquery.dataEditor` on the **3 datasets only**, and `bigquery.jobUser` on the project (it can't be granted more narrowly) |
+| `google_project_service.apis` | Enables Storage, BigQuery, Dataproc, Compute and IAM APIs |
+| `google_storage_bucket.lake` | Data lake. Uniform bucket-level access, public access blocked, objects under `raw/` deleted after 90 days. `force_destroy` only when `environment = "dev"` |
+| `google_bigquery_dataset.this[…]` | `oss_pulse_raw`, `oss_pulse_staging`, `oss_pulse_marts`, `oss_pulse_audit` |
+| `google_service_account.pipeline` | `oss-pulse-pipeline`, the identity Dataproc runs as |
+| IAM | `storage.objectAdmin` on the **lake bucket only**, `bigquery.dataEditor` on the **4 datasets only**, `bigquery.jobUser` and `dataproc.worker` on the project (they can't be granted more narrowly) |
+| VPC + subnet + firewall | `oss-pulse-subnet` for Dataproc: Private Google Access, no public IPs |
 
 **Decision: Terraform creates the datasets, and dbt only writes into them.**
-- Why: access can be granted per dataset instead of project-wide, every dataset gets the same location and labels, and `terraform destroy` removes everything.
+- Why: access is granted per dataset, not project-wide; every dataset gets the same location and labels; and `terraform destroy` removes everything.
 - Trade-off: a new dbt layer needs a Terraform change first.
-- `macros/generate_schema_name.sql` sends `dev` and `prod` models to `oss_pulse_staging` and `oss_pulse_marts`. Every other target (e.g. `ci`) writes to its own dataset, so CI can never overwrite real tables.
+- [generate_schema_name](dbt/oss_pulse/macros/generate_schema_name.sql) sends `prod` models to these datasets. `dev` and `ci` write to their own dataset, so they can never overwrite real tables.
 
-**Why remote state:** Terraform's state file is its record of which real resources it manages. Kept on a laptop, it can be lost (Terraform then tries to recreate resources that already exist) or diverge between machines and CI. Storing it in a separate, versioned GCS bucket gives:
-- one shared source of truth
-- locking, so two `apply` runs can't corrupt it
-- version history to roll back a bad state
-- no state file in git (it can contain sensitive values)
+**Why remote state.** Terraform's state file is its record of which real resources it manages. Kept on a laptop, it can be lost, and Terraform then tries to recreate resources that already exist. It can also diverge between machines. A separate, versioned GCS bucket gives:
+- one source of truth;
+- locking;
+- version history;
+- no state file in git.
 
-The state bucket is created once by hand, outside this configuration, so that `terraform destroy` can't delete the state that tracks it.
+`make tf-bootstrap` creates that bucket outside the configuration, so `terraform destroy` can't delete the state that tracks it.
 
-```bash
-gcloud auth application-default login
-# .env: set GCP_PROJECT_ID, GCP_REGION, TF_STATE_BUCKET
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit
-cp terraform/backend.hcl.example     terraform/backend.hcl         # edit
-make tf-bootstrap   # once: creates the versioned state bucket
-make tf-init
-make tf-plan        # review
-make tf-apply
-make tf-output      # bucket URL, dataset IDs, service account email
-```
-
-## Ingestion (GH Archive → GCS raw)
+### Ingestion (GH Archive → GCS raw)
 
 [ingestion/gharchive.py](ingestion/gharchive.py) streams each hourly file over HTTP **directly into GCS**, without writing to local disk:
 
@@ -62,79 +109,42 @@ https://data.gharchive.org/2026-10-01-15.json.gz
   → gs://$GCS_BUCKET/raw/gharchive/dt=2026-10-01/hr=15/2026-10-01-15.json.gz
 ```
 
-```bash
-make ingest DATE=2026-10-01                 # all 24 hours
-make ingest DATE=2026-10-01 HOURS=0-5,12    # selected hours
-make ingest DATE=2026-10-01 ARGS=--force    # re-upload even if unchanged
-make ingest-docker DATE=2026-10-01          # same, in the container (mounts your ADC login read-only)
-```
-
 | Behavior | Detail |
 |---|---|
 | Retries | Up to 3 attempts per hour (`INGEST_MAX_ATTEMPTS`), exponential backoff with jitter, on network errors, HTTP 5xx/429 and GCS 5xx/429. Other 4xx errors fail immediately |
 | 404 | Recorded as `missing` (not published yet, or a known gap); the other hours still run |
-| Idempotent | Same object path on every run. An hour is **skipped** if the object already exists with the same size; `--force` overwrites |
-| No partial files | The upload only becomes an object when the stream completes. A size mismatch against `Content-Length` deletes the object and retries |
-| Logging | One JSON line per hour (`hour`, `status`, `bytes`, `duration_s`, `attempts`), plus a `run_summary` line, e.g. `24/24 ok` or `22/24 ok; missing hours [3, 4]` |
-| Exit codes | `0` ok · `1` an hour failed · `2` usage/config error · `3` only missing hours (`--allow-missing` → 0). Any non-zero code fails the Airflow task, so it retries |
-| Config | Environment variables only: `GCS_BUCKET` (required), `GCS_RAW_PREFIX`, `GHARCHIVE_BASE_URL`, `INGEST_MAX_ATTEMPTS`, `GCP_PROJECT_ID` |
+| Idempotent | Same object path every run. An hour is **skipped** if the object already exists with the same size; `--force` overwrites |
+| No partial files | The upload only becomes an object when the stream completes; a size mismatch against `Content-Length` deletes it and retries |
+| Logging | One JSON line per hour (`hour`, `status`, `bytes`, `duration_s`, `attempts`) plus a `run_summary`, e.g. `24/24 ok` |
+| Exit codes | `0` ok · `1` an hour failed · `2` usage/config error · `3` only missing hours (`--allow-missing` → 0) |
 
-Tests (`make test`) cover the pure functions and use a fake HTTP session and bucket for retries, skipping and exit codes. They need no network or credentials.
+### Processing (Spark → processed/events)
 
-## Processing (Spark → processed/events)
-
-[spark/flatten_events.py](spark/flatten_events.py) turns one day of raw JSON into typed Parquet:
-
-```
-gs://$GCS_BUCKET/raw/gharchive/dt=2026-10-01/hr=*/…json.gz
-  → gs://$GCS_BUCKET/processed/events/dt=2026-10-01/part-*.snappy.parquet
-```
-
-```bash
-make spark-local    DATE=2026-10-01   # data/sample/ → data/processed/events (needs Java 17)
-make spark-dataproc DATE=2026-10-01   # gs:// → gs:// on Dataproc Serverless
-```
+[spark/flatten_events.py](spark/flatten_events.py) turns one day of raw JSON into typed Parquet (`processed/events/dt=<day>/`):
 
 | Behavior | Detail |
 |---|---|
-| Schema | Explicit `StructType`, no inference. Payload fields from [DATA_NOTES](docs/DATA_NOTES.md); the raw payload is kept as `payload_json` |
-| Columns | `event_id`, `event_type`, `created_at` (UTC timestamp), `event_date`, `event_hour`, actor/repo/org ids and names, `repo_owner`, `payload_action`, `pr_number`, `pr_merged`, `issue_number`, `push_size`, `ref`, `release_tag`, `payload_json`, `source_file` |
-| Time zone | Session time zone fixed to UTC; a test runs the JVM in America/Los_Angeles to prove dates don't shift |
+| Schema | Explicit `StructType`, no inference. The raw payload is kept as `payload_json` |
+| Time zone | Session time zone fixed to UTC. A test runs the JVM in America/Los_Angeles to prove dates don't shift |
 | Cleaning | Drops corrupt JSON, rows missing id/type/timestamp, and rows outside `--date`; de-duplicates on `event_id` |
-| Quality gate | Exits 1 **without writing** if there's no input, no valid rows, corrupt+invalid rows exceed `--max-bad-fraction` (default 1%), or rows dated outside `--date` exceed `--max-out-of-range-fraction` (default 1%), which catches time-zone bugs and wrong input paths |
-| Idempotent | Overwrites exactly `processed/events/dt=<date>/`; other dates are untouched |
-| Output | Snappy Parquet, `TIMESTAMP_MICROS` (BigQuery-friendly), files of ~128 MB (AQE) |
-| Logging | JSON lines on the driver: `input_rows`, `corrupt_rows`, `invalid_rows`, `out_of_range_rows`, `duplicate_rows`, `output_rows` |
-| Spark versions | Tested locally on Spark 4.3; ANSI-safe (`try_to_timestamp`), so it also runs on Spark 3.5 runtimes |
+| Quality gate | Exits 1 **without writing** if there's no input, no valid rows, more than 1% bad rows, or more than 1% rows outside the date |
+| Idempotent | Overwrites exactly `dt=<date>/` and writes `_SUCCESS` |
+| Runtime | Dataproc Serverless 2.2 (Spark 3.5), driver + 2 executors, as the `oss-pulse-pipeline` service account in `oss-pulse-subnet`. Tested locally on Spark 4 |
 
-**Why Dataproc Serverless:** no cluster to create, size or remember to delete; you pay only while the batch runs. It runs as the `oss-pulse-pipeline` service account, inside `oss-pulse-subnet` (Private Google Access, no public IPs), both created by Terraform.
+### Warehouse (BigQuery) and the partitioning decision
 
-## Warehouse (BigQuery raw.events)
+[warehouse/ddl/events.sql](warehouse/ddl/events.sql) defines `oss_pulse_raw.events`:
+- **partitioned by `DATE(created_at)`**;
+- **clustered by `event_type, repo_name`**;
+- `require_partition_filter = TRUE`.
 
-[warehouse/ddl/events.sql](warehouse/ddl/events.sql) defines `oss_pulse_raw.events`: 24 columns matching the Spark output, **partitioned by `DATE(created_at)`**, **clustered by `event_type, repo_name`**, with `require_partition_filter = TRUE`.
+The load job replaces exactly one partition (`events$YYYYMMDD`, `WRITE_TRUNCATE`), and only after Spark's `_SUCCESS` marker exists.
 
-```bash
-make bq-table                                        # create the table (idempotent DDL)
-make bq-load DATES="2026-10-01 2026-10-02"           # replace those daily partitions
-make bq-cost-demo DATES="2026-10-01 2026-10-02 2026-10-03" COST_DAY=2026-10-02
-```
+**Why partition by day.** Every question here is bounded in time: daily builds, "stars this week". A day query reads one partition instead of all history, and the daily load can replace one partition atomically, which makes re-runs idempotent. `require_partition_filter` turns this into a guardrail: a query without a date filter is rejected rather than scanning every day.
 
-[warehouse/load_events.sh](warehouse/load_events.sh) loads one day at a time:
-1. It refuses to load unless `processed/events/dt=<date>/_SUCCESS` exists, so a half-written Spark output is never loaded.
-2. It runs `bq load --replace` into `events$YYYYMMDD`. The load job **atomically replaces that one partition**, so re-runs are idempotent and other days are untouched. BigQuery rejects the load if any row belongs to another date.
-3. It fails if the partition ends up empty.
+**Why cluster by `event_type` first.** Almost every metric starts from one event type (stars = `WatchEvent`), and the types are very skewed: `WatchEvent` was 0.64% of rows and `PushEvent` 73.9%. Clustering lets BigQuery skip almost every block for such queries. `repo_name` comes second, for repo drill-downs.
 
-Loaded so far: 2026-10-01 (2,073,815 rows), 2026-10-02 (2,040,989) and 2026-10-03 (1,954,722). Each count matches Spark's `output_rows` exactly.
-
-The table is created by DDL, not Terraform. Terraform owns the datasets and IAM; the table schema changes together with the Spark code. This also avoids Terraform replacing (and emptying) the table on some schema changes.
-
-### Partitioning & clustering rationale
-
-Every question this project asks is bounded in time: daily dashboards, dbt models built one day at a time, "stars this week". So the table is **partitioned by `DATE(created_at)`** (UTC). A query for one day reads one partition instead of the whole history, and the daily load can replace exactly one partition, which makes it idempotent. At about 365 partitions a year it stays far below BigQuery's 10,000-partition limit. `require_partition_filter = TRUE` turns this into a guardrail: a query without a `created_at` filter is rejected instead of silently scanning every day ever loaded.
-
-Within a day, almost every metric starts from **one event type** (stars = `WatchEvent`, PRs = `PullRequestEvent`). `event_type` has only 16 values and is very skewed: across 2026-10-01 to 10-03, `WatchEvent` was 0.64% of rows and `PushEvent` 73.9%. Clustering on it **first** lets BigQuery skip almost every storage block for those queries. `repo_name` comes **second** for repo drill-downs (`WHERE repo_name = 'owner/name'`); clustering columns work like a sort order, so it only helps after `event_type` or on its own. Actor columns aren't clustered because queries rarely filter by them.
-
-**Measured result** (3 days loaded, question: top 10 starred repos on 2026-10-02, cache off):
+**Measured** (top 10 starred repos on 2026-10-02, 3 days loaded, cache off; [cost_demo.sh](warehouse/cost_demo.sh), [results](docs/bq_cost_results.json)):
 
 ![BigQuery cost before/after](docs/bq_cost_before_after.png)
 
@@ -142,58 +152,22 @@ Within a day, almost every metric starts from **one event type** (stars = `Watch
 |---|---|---|
 | A: unpartitioned copy, no filter | 168.5 MB | 168.8 MB |
 | B: unpartitioned copy, **same SQL as C** | 290.7 MB | 291.5 MB |
-| C: `raw.events`, partitioned + clustered | **0.9 MB** (−99.7% vs B) | 10.5 MB (BigQuery's 10 MB minimum per query) |
+| C: `raw.events`, partitioned + clustered | **0.9 MB** (−99.7% vs B) | 10.5 MB (BigQuery's 10 MB minimum) |
 
-- On an unpartitioned table, filters make a query *more* expensive (B > A): BigQuery also has to read `created_at` and `event_type` and can't skip anything.
-- Partitioning alone would cut B to roughly one third (one of three days). Clustering on `event_type` did the rest.
-- A dry run is an upper bound on bytes *processed*: a real job can prune more at run time, never less (billing still rounds up to the 10 MB minimum). Here, with a constant filter on the clustering column, the dry run already matched the real job (894,086 bytes). When the filter value comes from a subquery (`event_type IN (SELECT 'WatchEvent')`), BigQuery could not prune blocks at all: 97.7 MB, about 109× more. Filter clustered columns with constants or query parameters. `cost_demo.sh` still reports real job statistics, not estimates.
-- The numbers and job IDs are in [docs/bq_cost_results.json](docs/bq_cost_results.json); [warehouse/plot_cost.py](warehouse/plot_cost.py) draws the chart from that file.
+- On an unpartitioned table, filters make a query *more* expensive (B > A), because BigQuery must also read the filter columns and can't skip anything.
+- When the filter value came from a subquery, block pruning stopped working: 97.7 MB, about 109× more. So filter clustered columns with constants or parameters. The dbt macros follow that rule.
 
-## Transformation (dbt)
+### Transformation (dbt)
 
-[dbt/oss_pulse/](dbt/oss_pulse/) builds the analytics models from `raw.events` (dbt-core 1.12 + dbt-bigquery).
+[dbt/oss_pulse/](dbt/oss_pulse/): staging view → intermediate view (business rules) → marts ([lineage](docs/dbt_lineage.png)).
 
-![dbt lineage](docs/dbt_lineage.png)
+- **Incremental by partition.** One macro, [event_window](dbt/oss_pulse/macros/event_window.sql), decides which days a run rebuilds: `run_date` and the day before, or all history on a first build. Its bounds are constants, so BigQuery prunes partitions. Fact and aggregate tables swap partitions with **copy jobs** (`copy_partitions: true`), which cut a 2-day run from 987 MB to 333 MB processed. Re-running a day replaces it, so runs are idempotent.
+- **Environments.** `dev` → your own dataset (`DBT_DEV_DATASET`). `prod` → the Terraform datasets. `ci` → `oss_pulse_ci`. [profiles.yml](dbt/oss_pulse/profiles.yml) is committed: every value comes from `env_var()`, auth is ADC, and each query is capped at 10 GB billed.
+- **Bots.** [is_bot](dbt/oss_pulse/macros/is_bot.sql) flags logins ending in `[bot]` plus a seed of service accounts that don't, such as `copilot` (16k events across 6.5k repos in three days).
 
-| Layer | Model | Materialization | Grain / purpose |
-|---|---|---|---|
-| Staging | `stg_events` | view | 1:1 with `raw.events`; renamed, typed, lowercased; `payload_json` left out (78% of bytes) |
-| Intermediate | `int_events_enriched` | view | Adds `event_category` (seed), `is_bot` (macro) and metric flags (`is_star`, `is_pr_merged`, …) in one place |
-| Marts | `fct_events` | incremental, `insert_overwrite` | One row per event; FKs to the dims; partitioned by `event_date`, clustered by `event_type, repo_id` |
-| | `agg_repo_daily` | incremental, `insert_overwrite` | One row per repo × day: stars, forks, pushes, PRs opened/merged, issues opened, unique actors. **Bots excluded** |
-| | `dim_repo` | incremental, `merge` | One row per `repo_id`: latest name/owner, first/last seen |
-| | `dim_actor` | incremental, `merge` | One row per `actor_id`: latest login, `is_bot`, first/last seen |
-| | `dim_date` | table | Calendar from `dbt_utils.date_spine` |
-| | `agg_events_hourly` | incremental, `insert_overwrite` | Day × hour × event type × `is_bot` counts (~18k rows/month); serves the dashboard |
-| | `rpt_top_repos_7d` | table | Top 10 repos by stars over the latest loaded week, with names; serves the dashboard |
+### Orchestration (Airflow 3)
 
-```bash
-make dbt-deps && make dbt-debug
-make dbt-build                                   # dev: everything since history_start_date
-make dbt-build DBT_TARGET=prod RUN_DATE=2026-10-03   # daily: rebuild run_date and the day before
-make dbt-freshness                               # source freshness (warn 26h, error 50h)
-make dbt-docs                                    # target/static_index.html
-```
-
-**Environments.** `dev` writes everything to your own dataset (`DBT_DEV_DATASET`, e.g. `dbt_<yourname>`). `prod` writes to the Terraform-managed `oss_pulse_staging` and `oss_pulse_marts`. `ci` writes to `oss_pulse_ci`. [profiles.yml](dbt/oss_pulse/profiles.yml) is committed: every value comes from `env_var()`, and auth is OAuth through ADC. Each query is capped by `maximum_bytes_billed` (10 GB).
-
-**Incremental design.** One macro, [event_window](dbt/oss_pulse/macros/event_window.sql), decides which days a run rebuilds: `run_date` minus `lookback_days` up to `run_date`, or all history on a first build. Its bounds are constants, so BigQuery prunes partitions and `raw.events`' required partition filter is satisfied. The fact and aggregate tables replace partitions with **copy jobs** (`copy_partitions: true`), which cut a 2-day run from 987 MB to 333 MB processed. Re-running a day replaces it, so runs are idempotent (tested: identical row counts).
-
-**Tests (45 per build, all passing):**
-- `unique` + `not_null` on every primary key, and `unique_combination_of_columns` for `agg_repo_daily` and `agg_events_hourly`.
-- `relationships` from `fct_events` to `dim_repo`, `dim_actor` and `dim_date`.
-- `accepted_values` on `event_type`, with all 16 types.
-- A singular test, [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql).
-- A **unit test** for `is_bot`: `dependabot[bot]` and `COPILOT` → bot; `abbot` and `octocat` → not a bot.
-- Tests on the raw-backed views carry a `where:` filter on `created_at`.
-
-**Bots.** [is_bot](dbt/oss_pulse/macros/is_bot.sql) flags logins ending in `[bot]` plus a seed of service accounts that don't. The biggest is `copilot`, with 16k events across 6.5k repos in three days. The seed is evidence-based ([known_bots.csv](dbt/oss_pulse/seeds/known_bots.csv)). Automation running under personal-looking accounts can't be detected by name and remains counted as human.
-
-**Breaking it on purpose:** a duplicate event made `dbt build` fail and **skip** `agg_repo_daily`, so the bad data never reached the dashboard. Re-running the day fixed it. Write-up: [docs/DEVLOG.md](docs/DEVLOG.md).
-
-## Orchestration (Airflow 3)
-
-[airflow/dags/oss_pulse_daily.py](airflow/dags/oss_pulse_daily.py) runs the whole pipeline for one UTC day per run:
+[oss_pulse_daily.py](airflow/dags/oss_pulse_daily.py) runs one UTC day per run:
 
 ```
 ingest_raw → spark_flatten → load_bq_partition → dbt_source_freshness → dbt_build → record_audit
@@ -202,73 +176,166 @@ ingest_raw → spark_flatten → load_bq_partition → dbt_source_freshness → 
 | Task | How it runs | Why it is safe to re-run |
 |---|---|---|
 | `ingest_raw` | `BashOperator` → `python -m ingestion.gharchive --date {{ ds }}` | Skips hours already in GCS with the same size |
-| `spark_flatten` | `DataprocCreateBatchOperator` (deferrable) runs the uploaded `flatten_events.py` | Overwrites `processed/events/dt=<ds>/`; a new batch ID per attempt |
-| `load_bq_partition` | Python task: check `_SUCCESS`, then a load job into `raw.events$<ds_nodash>` | `WRITE_TRUNCATE` on one partition is atomic |
-| `dbt_source_freshness` | `dbt source freshness`, only when the day is recent (see below) | Read-only |
+| `spark_flatten` | `DataprocCreateBatchOperator` (deferrable) runs the uploaded job | Overwrites `dt=<ds>/`; new batch ID per attempt |
+| `load_bq_partition` | Checks `_SUCCESS`, then a load job into `raw.events$<ds_nodash>` | `WRITE_TRUNCATE` on one partition is atomic |
+| `dbt_source_freshness` | Only when the day ended < 2 days ago (backfills skip it) | Read-only |
 | `dbt_build` | `dbt build --target prod --vars '{run_date: <ds>}'` | `insert_overwrite` and `merge` |
-| `record_audit` | Python task, `trigger_rule=all_done` → `oss_pulse_audit.load_log` | Append-only: one row per attempt |
+| `record_audit` | `trigger_rule=all_done` → `oss_pulse_audit.load_log` | Append-only: one row per attempt |
 
-**Scheduling.**
-- `start_date=2026-10-01`, `catchup=True`, `max_active_runs=2`. Retries: 3, backed off at 5 → 10 → 20 min. Every task has an `execution_timeout`.
-- Dates come only from `{{ ds }}` / `{{ ds_nodash }}`.
-- The schedule is `CronDataIntervalTimetable("@daily")`. In Airflow 3, a plain `"@daily"` is a cron *trigger*: the run for 10-01 would start at 10-01 00:00, before that day's data exists. The interval timetable starts it after 10-02 00:00.
+**Design decisions.**
+- **Interval scheduling.** `CronDataIntervalTimetable("@daily")`: the run for day D starts after D+1 00:00 UTC, once the day is complete. In Airflow 3, plain `"@daily"` would start at D 00:00, before any of D's data exists.
+- **Dates and retries.** Dates come only from `{{ ds }}`. Retries back off 5 → 10 → 20 min, and every task has a timeout.
+- **One dbt build at a time** (`max_active_tis_per_dag=1`). Two days can ingest and load in parallel, but dbt builds don't collide. `depends_on_past` was tried first and **deadlocked** when an old day was re-run ([DEVLOG](docs/DEVLOG.md)).
+- **One Spark batch at a time.** A batch needs 12 vCPUs, and the project quota is 16. `spark_flatten` retries every 2 min because Dataproc releases vCPUs a little after a batch reports success.
+- **The audit records failures too.** `record_audit` runs after a failure, writes `status=failed`, then fails itself, so a failed pipeline can't show a green run.
+- **Alerts.** [alerts.py](airflow/dags/oss_pulse_lib/alerts.py) posts to a Slack webhook from the Airflow Variable `slack_webhook_secret` (`AIRFLOW_VAR_SLACK_WEBHOOK_SECRET` in `.env`). One alert per failed task, after the last retry.
+- **Credentials.** Your ADC file is mounted read-only from outside the repo. It is never in the DAG, the image or git.
+- **Docker.** [docker-compose.yaml](airflow/docker-compose.yaml) is the official Airflow 3.4.0 file, with every change marked `oss-pulse:`. [Dockerfile](airflow/Dockerfile) adds the ingestion dependencies, plus dbt in its own venv. Code is mounted, not baked in. The UI listens on `127.0.0.1` only.
 
-**Design decisions:**
-- **Only one dbt build at a time.** `dbt_build` has `max_active_tis_per_dag=1`. Two days can ingest and load in parallel, but only one dbt build runs at a time, because two builds would collide on the same temp tables and dimension `MERGE`s. Date order isn't needed: fact and aggregate partitions are independent, and the dims keep min/max timestamps and the name with the newer `last_seen_at`. I first used `depends_on_past=True`, but it **deadlocked** when I re-ran an old failed day: that run waited for a free slot, and the two newer runs' dbt waited for it.
-- **Only one Spark batch at a time.** Each Dataproc batch needs 12 vCPUs, and the project quota (`CPUS_ALL_REGIONS`) is 16, so a second concurrent batch is rejected. `spark_flatten` has `max_active_tis_per_dag=1`, which also counts deferred tasks. It retries every 2 min, because Dataproc releases the vCPUs a little after a batch reports SUCCEEDED. Raising the quota to 24+ would let two days run Spark in parallel.
-- **Freshness vs. backfills.** Freshness compares data with *now*, so for a backfilled October day it would always report "stale". The task only runs the check when the day ended less than 2 days ago; otherwise it logs a skip. This is the only place the wall clock is used.
-- **The audit records failures too.** `record_audit` runs even when an upstream task failed, writes `status=failed` and the failed task names, then fails itself. It is the DAG's only leaf, so otherwise a failed pipeline would show a green run.
-- **Alerts.** [alerts.py](airflow/dags/oss_pulse_lib/alerts.py) is the `on_failure_callback`. It posts to a Slack webhook taken from the Airflow Variable `slack_webhook_secret`, which you set as `AIRFLOW_VAR_SLACK_WEBHOOK_SECRET` in `.env`. It fires once per task after the last retry; without a webhook it only logs. A failed run sends one alert, not two.
-- **Credentials.** Your ADC file is mounted read-only from outside the repo. It is not in the DAG, the image or Git.
-
-**Docker setup.**
-- [docker-compose.yaml](airflow/docker-compose.yaml) is the official Airflow 3.4.0 file. Every change is marked `oss-pulse:`.
-- [Dockerfile](airflow/Dockerfile) extends the official image with the ingestion dependencies, plus dbt in its own venv so its pins don't conflict with Airflow's.
-- Code is mounted, not baked in, so edits don't need a rebuild.
-- The UI is published on `127.0.0.1` only.
-
-```bash
-make airflow-build && make up        # UI: http://localhost:8080 (airflow / airflow)
-make spark-upload                    # after changing spark/flatten_events.py
-make bq-audit-table                  # once: creates oss_pulse_audit.load_log
-make airflow-check                   # DAG imports cleanly inside the real image (also in CI)
-make backfill START=2026-10-01 END=2026-10-31   # re-run missing/failed days (DAG must be unpaused)
-make chaos-test DAY=2026-10-15       # clear a finished day, re-run it, compare counts
-```
-
-**Results: October 2026 backfill (catchup, 31 runs).**
+**October 2026 backfill (catchup, 31 runs):**
 
 | Check | Result |
 |---|---|
-| Runs | **31/31 success**; `OSS_PULSE_END_DATE=2026-10-31` stopped catchup there |
-| Rows | **30,008,428** in `raw.events` = 30,008,428 in `fct_events`; audit `rows_loaded` matches `raw.events` on all 31 days; 0 duplicate `event_id`s |
-| Audit trail | 34 rows: one `success` per day, 2 earlier `failed` attempts (10-08 and 10-10, see DEVLOG) and the chaos test's second `success` for 10-15 |
-| Chaos test (2026-10-15) | Cleared and re-run in 4 min: `raw.events`, `fct_events` (the day and its lookback day) and `agg_repo_daily` counts identical before and after |
-| Failure alert | Smoke-tested in Airflow 3.4: the Variable is read through the Execution API and the message is posted |
-| Cost (measured) | Dataproc 9.5 DCU-hours (35 successful batches; the 23 quota-rejected submits never started, so they cost nothing) · BigQuery 118 GB billed in 2,001 query jobs, inside the 1 TB free tier · GCS 17.8 GiB (7.4 raw + 10.5 Parquet) |
+| Runs | **31/31 success** |
+| Rows | **30,008,428** in `raw.events` = `fct_events`; audit `rows_loaded` matches on all 31 days; 0 duplicate `event_id`s |
+| Audit trail | 34 rows: one `success` per day, 2 earlier `failed` attempts (laptop sleep, see DEVLOG), and the chaos test's second `success` |
+| Chaos test (10-15) | Cleared and re-run in 4 min: every count identical before and after |
+| Failure alert | Smoke-tested end to end in Airflow 3.4 |
 
-The backfill also showed that GH Archive's push/create/delete feed was **intermittent in October and stopped on 2026-10-27**, while stars and PRs stayed steady ([DATA_NOTES](docs/DATA_NOTES.md#volume)). Daily totals and push counts are therefore not comparable across October.
+## Data quality
 
-## Dashboard (Looker Studio)
+Checks at every layer. A failure stops the run before bad data reaches the next layer.
 
-![dashboard](docs/dashboard.png)
+| Layer | Check | On failure |
+|---|---|---|
+| Ingestion | HTTP status, `Content-Length` vs uploaded size, 24 hours present | Retry; exit 1 (or 3 for missing hours) fails the task |
+| Spark | Explicit schema; ≤ 1% corrupt/invalid rows; ≤ 1% rows outside the date; de-duplication on `event_id` | Exit 1, **nothing written** |
+| Load | `_SUCCESS` must exist; 0 rows loaded = error; BigQuery rejects rows from another date | Task fails; partition unchanged |
+| dbt sources | **Freshness**: `max(created_at)` warn > 26 h, error > 50 h | Run fails before building |
+| dbt models | **45 tests**: `unique` + `not_null` on every key; `unique_combination_of_columns` on the aggregates; `relationships` from `fct_events` to all 3 dims; `accepted_values` for the 16 event types and 24 hours; [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql); a **unit test** for `is_bot` (`dependabot[bot]`, `COPILOT` → bot; `abbot`, `octocat` → human) | A failing test **skips every downstream model** |
+| Run | `audit.load_log`: status, rows loaded, failed tasks, run id | Failed runs are recorded and alerted |
+| Idempotency | `make chaos-test DAY=…` clears a finished day, re-runs it, compares 5 counts | Exit 1 if anything changed |
 
-**Live report:** [Looker Studio](https://datastudio.google.com/reporting/b792d5da-dff2-41cb-b080-cb675a64c5ca) (view-only, no sign-in needed).
+**Broken on purpose.** I inserted a duplicate event into `fct_events`. The `unique` test failed, `dbt build` exited non-zero, and `agg_repo_daily` (what the dashboard reads) was **skipped**, so it kept the previous correct numbers. Re-running the day replaced the partition and removed the duplicate, with no manual `DELETE` ([write-up](docs/DEVLOG.md)).
 
-Four tiles: events by type, daily events by category, top 10 repos by stars over the latest week, and a weekday × hour heatmap of human activity. Plus a date-range control and a "how to read" note on the October source gap. Build spec, field setup and cost: [docs/DASHBOARD.md](docs/DASHBOARD.md).
+**What the tests did *not* catch.** GH Archive stopped publishing push/create/delete events on several October days. Every test passed, because the data was valid, just incomplete. It was found by looking at the backfill ([DATA_NOTES](docs/DATA_NOTES.md#volume)). See the volume check under [future improvements](#limitations-and-future-improvements).
 
-**It reads two small tables built for it, never `raw` and never the big marts.** Each chart refresh is a BigQuery query paid by the project. On `fct_events` the same tiles would scan ~1 GB per refresh. On `agg_events_hourly` (1 MB) and `rpt_top_repos_7d` (10 rows), every query stays at the 10 MB billing minimum.
+## Dashboard
+
+**[Looker Studio report](https://datastudio.google.com/reporting/b792d5da-dff2-41cb-b080-cb675a64c5ca)** (view-only, no sign-in). Screenshot at the top of this page.
+
+- **Tiles:** events by type, daily events by category, top 10 repos by stars over the latest week, and an hour × weekday heatmap of human activity.
+- **Also:** a date-range control and a "how to read" note on the October source gap.
+
+It reads only `agg_events_hourly` (1 MB) and `rpt_top_repos_7d` (10 rows), never `raw` and never the big marts. Each chart refresh is a billed query: on `fct_events` the same tiles would scan ~1 GB, and here each stays at the 10 MB minimum. Build spec: [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
 ## How to run
+
+### Prerequisites
+
+| Tool | Version | Used for |
+|---|---|---|
+| A GCP project with billing enabled | You are Owner (Terraform grants IAM; Dataproc needs `iam.serviceAccountUser`); vCPU quota `CPUS_ALL_REGIONS` ≥ 12 | Everything in the cloud |
+| [gcloud CLI](https://cloud.google.com/sdk/docs/install) | any recent | Auth, state bucket, Spark upload |
+| [Terraform](https://developer.hashicorp.com/terraform/install) | ≥ 1.5 | Infrastructure |
+| Docker Desktop (Compose v2) | ≥ 4 GB RAM for Docker | Airflow |
+| Python | ≥ 3.11 | Ingestion, dbt, tests |
+| Java | 17 | Spark tests and `spark-local` only |
+| make, git | | |
+
+### Steps
+
 ```bash
-cp .env.example .env   # fill in values
-make setup             # install deps
-make airflow-build && make up   # start Airflow locally
-make test lint
-make down
+# 1. Get the code and the Python environment
+git clone https://github.com/trinhtran-it/oss-pulse.git && cd oss-pulse
+make setup                      # .venv with all deps + dbt packages
+make test lint                  # 88 tests, no cloud access needed
+
+# 2. Configure: .env is the only file to edit
+cp .env.example .env
+#    GCP_PROJECT_ID, GCP_REGION, GCS_BUCKET (globally unique), TF_STATE_BUCKET (globally unique),
+#    DBT_DEV_DATASET, and FERNET_KEY from:
+.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+
+# 3. Log in (user + Application Default Credentials, used by Terraform, dbt and Airflow)
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project <your-project-id>
+
+# 4. Create the cloud resources (shows the plan and asks before applying)
+make infra-up                   # state bucket, Terraform, BigQuery tables, Spark job upload
+
+# 5. Run the pipeline in Airflow
+make airflow-build up           # UI: http://localhost:8080 (airflow / airflow)
+make airflow-unpause            # catchup: one run per day from OSS_PULSE_START_DATE
 ```
 
-## Cost
-![bq cost](docs/bq_cost_before_after.png)
+**How many days run.** Unpausing creates one run per day from `OSS_PULSE_START_DATE` (default 2026-10-01) to `OSS_PULSE_END_DATE` (unset = until yesterday, then daily).
+- **Quick demo:** set both to `2026-10-31` in `.env`. One day runs end to end in about 15 minutes for a few cents.
+- **Full October:** `2026-10-01` → `2026-10-31`. About 30M events and ~$1 of Dataproc. Several hours, because Spark runs one day at a time under the default quota.
 
-_TODO: BigQuery bytes scanned before/after partitioning + clustering._
+Watch the runs in the UI. Each finished day adds a row to `oss_pulse_audit.load_log`.
+
+```bash
+# 6. Other useful commands (`make help` lists them all)
+make ingest DATE=2026-10-31                       # one pipeline step by hand
+make dbt-build RUN_DATE=2026-10-31                # dbt into your dev dataset (the first build reads
+                                                  #   every loaded day: ~7 GB per model for October)
+make backfill START=2026-10-01 END=2026-10-03     # re-run failed or missing days
+make chaos-test DAY=2026-10-15                    # prove a re-run changes nothing
+
+# 7. Clean up
+make down                       # stop Airflow
+make infra-down                 # delete bucket, datasets and IAM (asks first; dev only deletes data)
+```
+
+**Dashboard.** Connect Looker Studio to the two tables as described in [docs/DASHBOARD.md](docs/DASHBOARD.md). It's about 30 minutes of clicking, because Looker Studio has no config-as-code.
+
+## Cost
+
+What this project actually used from 2026-11-01 to 11-19. That covers every development run plus the October backfill, measured from `INFORMATION_SCHEMA.JOBS`, Dataproc batch usage and storage sizes. Prices are list prices, US regions.
+
+| Service | Measured usage | Price | Cost |
+|---|---|---|---|
+| Dataproc Serverless | 10.56 DCU-hours, 1,069 GiB-hours shuffle storage (61 batches; 23 quota-rejected ones never started) | $0.060 / DCU-hour, $0.000055 / GiB-hour | **≈ $0.70** |
+| BigQuery queries | 129 GiB billed in 2,788 jobs | first 1 TiB / month free | **$0** |
+| BigQuery loads + copies | 45.8 GiB loaded, 170 partition copies | free | **$0** |
+| BigQuery storage | 36.4 GiB (raw 32.7, marts 3.7) | first 10 GiB free, then ≈ $0.02 / GiB-month | **≈ $0.55 / month** |
+| Cloud Storage | 17.8 GiB (raw 7.4, Parquet 10.5) | ≈ $0.02 / GiB-month | **≈ $0.36 / month** |
+| Airflow | local Docker | — | **$0** |
+| **Total** | | | **≈ $0.70 one-off + ≈ $0.90 / month storage, under $2 for the month** |
+
+- **Steady state, one new day per day:** about 0.3 DCU-hours ($0.02) and ~4 GiB of queries per day, so about $1/month plus storage growth.
+- **Biggest cost levers:**
+  - Partitioning + clustering: −99.7% bytes on the benchmark query.
+  - `copy_partitions`: −66% on incremental builds.
+  - The dashboard reading 1 MB tables instead of `fct_events`.
+  - The 90-day lifecycle rule on `raw/`.
+- **Regional prices:** in asia-southeast1 (where this ran) they are somewhat higher. The GCP Billing report for the project is the final number.
+
+## Limitations and future improvements
+
+| Limitation | Impact | Improvement | Effort / cost |
+|---|---|---|---|
+| **No volume check.** Valid but incomplete days pass every test | The October push/create/delete gap was found by eye | dbt test per event type: warn when a type that existed yesterday is 0, or the day is < 20% of the trailing 7-day median | ~2 h, free |
+| **Airflow runs on a laptop** | Sleep caused heartbeat failures and false alerts during the backfill | Cloud Composer 3 (managed), or a small VM running this same Compose file | Composer: several hundred $/month; e2-standard-2 VM: ~$50/month |
+| **Tests scan full history** (`unique` on 30M `event_id`s) | Test cost grows every day | `where:` limited to the rebuilt days, plus a weekly full run | ~1 h, free |
+| **Bot detection by login name only** | Automation on personal-looking accounts counts as human | Behavioral rules: events/hour, repos touched per hour | ~1 day |
+| **One month of data** | Weekday patterns aren't reliable (4–5 samples each); push metrics are incomplete for Oct 2026 | Backfill several months, and show source eras on the dashboard | Dataproc ~$1 per month of data |
+| **Spark is more than today's volume needs** | ~100k events/day now; Spark was sized for 2025 volumes (3.5M/day) | Load raw JSON straight into BigQuery and flatten in dbt; keep Spark for large backfills | ~1 day |
+| **"Marts only" for the dashboard is a convention** | The dashboard credential (my account) could read `raw` | Service account with `dataViewer` on `oss_pulse_marts` only | ~30 min of Terraform, free |
+| **CI doesn't run dbt against BigQuery** | SQL errors show up only on a real build | `dbt build --empty --target ci` with Workload Identity Federation | ~2 h, ~free |
+| **Spark runs one day at a time** | A month's backfill takes hours | Raise the `CPUS_ALL_REGIONS` quota to 24+ | free (quota request) |
+
+## Repository layout
+
+```
+terraform/            GCP resources (bucket, datasets, service account, IAM, network)
+ingestion/            GH Archive → GCS (gharchive.py, Dockerfile, tests)
+spark/                raw JSON → Parquet (flatten_events.py, tests)
+warehouse/            raw.events and load_log DDL, load script, cost benchmark
+dbt/oss_pulse/        staging → intermediate → marts, seeds, macros, tests
+airflow/              DAG, alert callback, Compose file, image, chaos test
+docs/                 DATA_NOTES, DEVLOG, DASHBOARD, diagrams and screenshots
+.github/workflows/    CI: lint, tests, image builds, dbt parse, DAG import
+```

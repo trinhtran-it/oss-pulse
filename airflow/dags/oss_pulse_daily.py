@@ -56,8 +56,10 @@ SPARK_MAIN = f"gs://{BUCKET}/code/spark/flatten_events.py"
 
 PROCESSED_PREFIX = "processed/events"
 
-# Optional last day to schedule (YYYY-MM-DD). Unset = run forever (normal operation).
-# Set it to stop catchup at a fixed day, e.g. to backfill one month only.
+# Days to schedule (YYYY-MM-DD). catchup=True creates one run per day from START_DATE, so a new
+# deployment backfills everything from there. Set both to the same day to reproduce one day only.
+# END_DATE unset = run forever (normal operation).
+START_DATE = os.environ.get("OSS_PULSE_START_DATE") or "2026-10-01"
 END_DATE = os.environ.get("OSS_PULSE_END_DATE") or None
 
 # dbt: target/ and logs/ go under Airflow's logs folder, one directory per day and task,
@@ -102,7 +104,7 @@ with DAG(
     # cron TRIGGER (create_cron_data_intervals=False): it would start the 10-01 run at 10-01
     # 00:00, before any of that day's GH Archive hours exist.
     schedule=CronDataIntervalTimetable("@daily", timezone="UTC"),
-    start_date=pendulum.datetime(2026, 10, 1, tz="UTC"),
+    start_date=pendulum.parse(START_DATE, tz="UTC"),
     end_date=pendulum.parse(END_DATE, tz="UTC") if END_DATE else None,
     catchup=True,
     max_active_runs=2,

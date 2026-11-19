@@ -1,0 +1,52 @@
+// oss-pulse architecture. Render: make diagrams  (-> docs/architecture.png)
+digraph architecture {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=12, pad=0.3, nodesep=0.45, ranksep=0.55,
+         bgcolor="white", newrank=true, compound=true]
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10,
+         fillcolor="#F4F6F8", color="#7B8794", penwidth=1, margin="0.14,0.07"]
+  edge  [fontname="Helvetica", fontsize=9, color="#52606D", fontcolor="#323F4B", arrowsize=0.7]
+
+  gharchive [label=<<b>GH Archive</b><br/><font point-size="9">hourly .json.gz<br/>~85k–2.1M events/day</font>>,
+             shape=cylinder, fillcolor="white"]
+
+  subgraph cluster_gcp {
+    label=<<b>Google Cloud</b> <font point-size="9">(Terraform: bucket, datasets, service account, subnet)</font>>
+    style="rounded,dashed"; color="#9AA5B1"; fontcolor="#323F4B"; margin=14
+
+    raw       [label=<<b>GCS raw/</b><br/><font point-size="9">dt=YYYY-MM-DD/hr=HH/*.json.gz</font>>, shape=folder]
+    spark     [label=<<b>Dataproc Serverless</b><br/><font point-size="9">Spark: flatten_events.py<br/>schema, UTC, quality gates</font>>,
+               fillcolor="#E6F0FA", color="#3E6E9E"]
+    processed [label=<<b>GCS processed/events/</b><br/><font point-size="9">dt=YYYY-MM-DD/*.parquet + _SUCCESS</font>>, shape=folder]
+
+    subgraph cluster_bq {
+      label=<<b>BigQuery</b>>; style="rounded"; color="#9AA5B1"; fillcolor="#FBFCFD"; margin=12
+      bqraw   [label=<<b>oss_pulse_raw.events</b><br/><font point-size="9">partitioned by day<br/>clustered by event_type, repo_name</font>>,
+               shape=cylinder, fillcolor="white"]
+      staging [label=<<b>oss_pulse_staging</b><br/><font point-size="9">stg + int views, seeds</font>>]
+      marts   [label=<<b>oss_pulse_marts</b><br/><font point-size="9">fct_events, dim_repo/actor/date<br/>agg_repo_daily, agg_events_hourly<br/>rpt_top_repos_7d</font>>,
+               fillcolor="#E8F5EC", color="#3F8F5A"]
+      audit   [label=<<b>oss_pulse_audit.load_log</b><br/><font point-size="9">one row per run</font>>, fillcolor="white"]
+    }
+  }
+
+  looker [label=<<b>Looker Studio</b><br/><font point-size="9">reads 2 small marts only</font>>,
+          fillcolor="#FFF4E5", color="#B7791F"]
+
+  airflow [label=<<b>Airflow 3</b> (Docker)<br/><font point-size="9">oss_pulse_daily: one UTC day per run<br/>retries, alerts, catchup/backfill</font>>,
+           fillcolor="#EEEAF7", color="#6B5BA8"]
+
+  gharchive -> raw       [label="① ingest_raw\nstream, no local disk"]
+  raw       -> spark     [label="② spark_flatten"]
+  spark     -> processed
+  processed -> bqraw     [label="③ load_bq_partition\nWRITE_TRUNCATE day"]
+  bqraw     -> staging   [label="④ freshness\n⑤ dbt build"]
+  staging   -> marts
+  marts     -> looker
+  airflow   -> audit     [label="⑥ record_audit", style=dashed, color="#6B5BA8", fontcolor="#6B5BA8"]
+
+  // Two rows: files on top, warehouse below; Airflow drives both.
+  { rank=same; gharchive; raw; spark; processed }
+  { rank=same; bqraw; staging; marts; looker }
+  { rank=same; airflow; audit }
+  bqraw -> audit [style=invis]
+}
