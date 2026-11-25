@@ -177,7 +177,7 @@ jobs:
           fi
       - name: keep dbt results
         if: always() && steps.cloud.outputs.enabled == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dbt-ci-results
           path: |
