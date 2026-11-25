@@ -16,3 +16,13 @@ sources:
             error_after: { count: 50, period: hour }
             # The partition filter keeps the freshness query cheap (and allowed).
             filter: "created_at >= timestamp_sub(current_timestamp(), interval 3 day)"
+      - name: github_repo_metadata
+        description: >
+          GitHub REST API answers for the top repositories (ingestion/github_repos.py): one row
+          per call, append-only. Small, so no partition filter is required.
+        config:
+          loaded_at_field: fetched_at
+          freshness:
+            # each repo is re-fetched weekly, so the newest row can be up to 7 days old
+            warn_after: { count: 8, period: day }
+            error_after: { count: 15, period: day }

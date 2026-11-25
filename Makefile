@@ -27,7 +27,7 @@ TF_BACKEND = $(if $(wildcard terraform/backend.hcl),-backend-config=backend.hcl,
 	infra-up infra-down tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output \
 	up down airflow-build airflow-check airflow-unpause airflow-trigger backfill chaos-test \
 	ingest ingest-image ingest-docker spark-upload spark-local spark-dataproc \
-	bq-table bq-audit-table bq-load bq-cost-demo bq-cost-chart metrics \
+	bq-table bq-audit-table bq-github-table enrich bq-load bq-cost-demo bq-cost-chart metrics \
 	dbt-deps dbt-debug dbt-build dbt-test dbt-freshness dbt-docs diagrams
 
 help: ## Show this list
@@ -76,7 +76,7 @@ diagrams: ## Render docs/*.png from docs/diagrams/*.dot (needs Graphviz)
 ## Cloud infrastructure (Terraform + BigQuery tables + Spark job)
 infra-up: check-env tf-bootstrap tf-init ## Create or update everything in GCP (asks before applying)
 	$(TF) apply
-	$(MAKE) bq-table bq-audit-table spark-upload
+	$(MAKE) bq-table bq-audit-table bq-github-table spark-upload
 
 infra-down: check-env ## Destroy everything Terraform created (asks first; keeps the state bucket)
 	$(TF) destroy
@@ -118,6 +118,7 @@ airflow-build: ## Build the Airflow image (official 3.4 + ingestion deps + dbt)
 # dbt_packages/ is mounted from the host, so install packages first.
 up: check-env dbt-deps ## Start Airflow locally and wait until it is healthy
 	$(COMPOSE) up -d --wait
+	$(AIRFLOW) pools set dbt 1 "One dbt build at a time, across DAGs" >/dev/null
 
 down: ## Stop Airflow (keeps its database volume)
 	$(COMPOSE) down
@@ -201,6 +202,14 @@ bq-table: ## Create raw.events (idempotent DDL)
 bq-audit-table: ## Create audit.load_log (idempotent DDL)
 	$(BQ) --dataset_id=$(GCP_PROJECT_ID):$(BQ_DATASET_AUDIT) query --use_legacy_sql=false \
 		< warehouse/ddl/load_log.sql
+
+bq-github-table: ## Create raw.github_repo_metadata (idempotent DDL)
+	$(BQ) --dataset_id=$(GCP_PROJECT_ID):$(BQ_DATASET_RAW) query --use_legacy_sql=false \
+		< warehouse/ddl/github_repo_metadata.sql
+
+# make enrich [ARGS="--dry-run" | ARGS="--as-of 2026-10-31 --top-n 200 --max-requests 200"]
+enrich: ## GitHub API -> raw.github_repo_metadata for the top repos (token from .env)
+	$(PY) -m ingestion.github_repos $(ARGS)
 
 bq-load: ## Parquet -> raw.events partitions: DATES="YYYY-MM-DD ..."
 	warehouse/load_events.sh $(DATES)

@@ -4,22 +4,13 @@
 --
 -- The window ends at the latest loaded day, not at "today": a paused pipeline or a historical
 -- backfill still shows a full week. window_start / window_end are columns so the tile can say which week.
--- window_end is read from partition metadata before the query runs, so the 7-day filter is a
--- constant and BigQuery prunes agg_repo_daily to 7 partitions.
+-- window_end comes from partition metadata (macros/latest_partition_date.sql), so the 7-day
+-- filter is a constant and BigQuery prunes agg_repo_daily to 7 partitions.
+-- language: from the GitHub API (dim_repo_github); NULL until the repo has been enriched.
 
 {{ config(materialized='table') }}
 
-{%- set window_end = none -%}
-{%- if execute -%}
-    {%- set agg = ref('agg_repo_daily') -%}
-    {%- set latest = run_query(
-        "select max(parse_date('%Y%m%d', partition_id)) "
-        ~ "from `" ~ agg.database ~ "." ~ agg.schema ~ "`.INFORMATION_SCHEMA.PARTITIONS "
-        ~ "where table_name = '" ~ agg.identifier ~ "' "
-        ~ "and regexp_contains(partition_id, r'^[0-9]{8}$') and total_rows > 0"
-    ) -%}
-    {%- set window_end = latest.columns[0].values()[0] -%}
-{%- endif %}
+{%- set window_end = latest_partition_date(ref('agg_repo_daily')) %}
 
 with repo_totals as (
 
@@ -57,6 +48,7 @@ select
     dim_repo.repo_name,
     -- built here rather than read from dim_repo.repo_url: halves the bytes scanned (216 vs 496 MB)
     'https://github.com/' || dim_repo.repo_name as repo_url,
+    github.language,
     top_repos.stars,
     top_repos.forks,
     top_repos.prs_merged,
@@ -71,3 +63,5 @@ select
 from top_repos
 inner join {{ ref('dim_repo') }} as dim_repo
     on top_repos.repo_id = dim_repo.repo_id
+left join {{ ref('dim_repo_github') }} as github
+    on top_repos.repo_id = github.repo_id

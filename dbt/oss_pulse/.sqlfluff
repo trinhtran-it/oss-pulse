@@ -16,5 +16,5 @@ library_path = sqlfluff_libs
 
 
 [sqlfluff:rules:references.keywords]
-# dim_date.year / quarter / month are part of the mart's public columns.
-ignore_words = year, quarter, month
+# Public column names: dim_date.year / quarter / month, and GitHub's own field "language".
+ignore_words = year, quarter, month, language
