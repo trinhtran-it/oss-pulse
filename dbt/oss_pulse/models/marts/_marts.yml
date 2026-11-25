@@ -250,6 +250,60 @@ models:
       - name: window_end
         description: Last day of the 7-day window (UTC) = latest day loaded in agg_repo_daily.
 
+  - name: dim_repo_history
+    description: >
+      SCD Type 2 for repositories: one row per repo per period under one owner/name. A rename,
+      a transfer, or a rename back each start a new row. Derived from events (not a dbt snapshot),
+      so backfills and full refreshes rebuild the exact same history. Point-in-time join:
+      created_at >= valid_from and (created_at < valid_to or valid_to is null).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [repo_id, repo_version]
+    columns:
+      - name: repo_version_key
+        description: Surrogate key, hash of (repo_id, repo_version).
+        data_tests: [unique, not_null]
+      - name: repo_id
+        description: GitHub repository id. Foreign key to dim_repo.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_repo')
+                field: repo_id
+      - name: repo_version
+        description: 1 for the first name seen, then +1 per rename or transfer.
+        data_tests: [not_null]
+      - name: repo_name
+        description: owner/name during this period, lowercase.
+        data_tests: [not_null]
+      - name: repo_owner
+        description: Owner part of repo_name.
+      - name: previous_repo_name
+        description: repo_name of the previous period; NULL for the first.
+      - name: change_type
+        description: How this period started.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [first_seen, renamed, transferred, transferred_and_renamed]
+      - name: valid_from
+        description: >
+          First event under this name (UTC). The rename itself isn't published, so it happened
+          between the previous period's last_seen_at and valid_from.
+        data_tests: [not_null]
+      - name: valid_to
+        description: valid_from of the next period (exclusive); NULL for the current one.
+      - name: is_current
+        description: TRUE for the latest period. Its repo_name equals dim_repo.repo_name.
+        data_tests: [not_null]
+      - name: last_seen_at
+        description: Last event in this period (UTC).
+      - name: events
+        description: Events in this period, bots included.
+
 unit_tests:
   - name: test_is_bot_flags_apps_and_known_bots_only
     description: >
@@ -278,3 +332,21 @@ unit_tests:
         - { actor_id: 2, is_bot: true }
         - { actor_id: 3, is_bot: false }
         - { actor_id: 4, is_bot: false }
+
+  - name: test_repo_history_periods
+    description: >
+      Runs split at midnight continue one period; a rename back (A -> B -> A) is a new period;
+      owner changes are "transferred"; valid_to chains to the next valid_from.
+    model: dim_repo_history
+    given:
+      - input: ref('int_repo_name_segments')
+        rows:
+          - { repo_id: 1, event_date: "2026-10-01", run_number: 1, repo_name: "a/x", first_seen_at: "2026-10-01 10:00:00", last_seen_at: "2026-10-01 23:59:00", events: 5 }
+          - { repo_id: 1, event_date: "2026-10-02", run_number: 1, repo_name: "a/x", first_seen_at: "2026-10-02 00:01:00", last_seen_at: "2026-10-02 08:00:00", events: 2 }
+          - { repo_id: 1, event_date: "2026-10-02", run_number: 2, repo_name: "b/x", first_seen_at: "2026-10-02 09:00:00", last_seen_at: "2026-10-02 09:30:00", events: 1 }
+          - { repo_id: 1, event_date: "2026-10-03", run_number: 1, repo_name: "a/x", first_seen_at: "2026-10-03 12:00:00", last_seen_at: "2026-10-03 12:00:00", events: 1 }
+    expect:
+      rows:
+        - { repo_id: 1, repo_version: 1, repo_name: "a/x", change_type: "first_seen", valid_from: "2026-10-01 10:00:00", valid_to: "2026-10-02 09:00:00", is_current: false, events: 7 }
+        - { repo_id: 1, repo_version: 2, repo_name: "b/x", change_type: "transferred", valid_from: "2026-10-02 09:00:00", valid_to: "2026-10-03 12:00:00", is_current: false, events: 1 }
+        - { repo_id: 1, repo_version: 3, repo_name: "a/x", change_type: "transferred", valid_from: "2026-10-03 12:00:00", valid_to: null, is_current: true, events: 1 }

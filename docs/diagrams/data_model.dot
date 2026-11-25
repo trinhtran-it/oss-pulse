@@ -22,6 +22,16 @@ digraph data_model {
       <tr><td align="left">first_seen_at, last_seen_at</td></tr>
     </table>>]
 
+  dim_repo_history [label=<
+    <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#7B8794" bgcolor="white">
+      <tr><td bgcolor="#E6F0FA" align="left"><b>dim_repo_history</b>  <font point-size="9">SCD Type 2, from events</font></td></tr>
+      <tr><td align="left"><font point-size="9" color="#52606D">1 row per repo × period under one name · 5.89M</font></td></tr>
+      <tr><td align="left"><b>repo_version_key</b>  PK</td></tr>
+      <tr><td align="left" port="fk">repo_id  FK, repo_version</td></tr>
+      <tr><td align="left">repo_name, repo_owner, previous_repo_name, change_type</td></tr>
+      <tr><td align="left" port="valid">valid_from, valid_to, is_current</td></tr>
+    </table>>]
+
   dim_actor [label=<
     <table border="1" cellborder="0" cellspacing="0" cellpadding="4" color="#7B8794" bgcolor="white">
       <tr><td bgcolor="#E6F0FA" align="left"><b>dim_actor</b>  <font point-size="9">incremental merge</font></td></tr>
@@ -75,6 +85,10 @@ digraph data_model {
   fct_events:date  -> dim_date:pk  [label="many : 1"]
   fct_events:repo  -> dim_repo:pk  [label="many : 1"]
   fct_events:actor -> dim_actor:pk [label="many : 1"]
+
+  // SCD2: every name a repo has had; point-in-time join on created_at
+  dim_repo:pk -> dim_repo_history:fk [label="1 : many", arrowhead=crow, dir=forward]
+  fct_events:repo -> dim_repo_history:valid [style=dashed, color="#52606D", label="name at event time", constraint=false]
 
   // Reporting tables, built from the fact (dashed = "aggregated from")
   agg_repo_daily    -> fct_events [dir=back, style=dashed, color="#B7791F", label="aggregates"]

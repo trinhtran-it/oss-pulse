@@ -58,6 +58,7 @@ A star schema in `oss_pulse_marts`, plus reporting tables built for the dashboar
 |---|---|---|---|
 | `fct_events` | GitHub event | incremental `insert_overwrite`, partitioned by `event_date`, clustered by `event_type, repo_id` | 30.0M |
 | `dim_repo` | repository (`repo_id`, stable across renames) | incremental `merge`; latest name, first/last seen | 5.8M |
+| `dim_repo_history` | repository × period under one owner/name (**SCD Type 2**) | table, rebuilt daily from `int_repo_name_segments` | 5.89M |
 | `dim_actor` | account (`actor_id`) | incremental `merge`; latest login, `is_bot` | 3.6M |
 | `dim_date` | calendar day | table (`dbt_utils.date_spine`) | 457 |
 | `agg_repo_daily` | repo × day, **bots excluded** | incremental `insert_overwrite` | 9.1M |
@@ -71,6 +72,18 @@ A star schema in `oss_pulse_marts`, plus reporting tables built for the dashboar
 - a merged PR counts under both the old and the new payload format.
 
 Every mart counts from these flags. The data's quirks are documented in [DATA_NOTES](docs/DATA_NOTES.md).
+
+**Repository history (SCD2).** Repos get renamed and transferred much more often than I expected: **42,422 repos (0.7%) in October alone**, one of them 11 times. [dim_repo_history](dbt/oss_pulse/models/marts/dim_repo_history.sql) keeps every period with `valid_from` / `valid_to` / `is_current` and a `change_type` (`renamed` 31k, `transferred` 10.5k, both 2.5k). In the sample I joined, **1.4% of events happened under a name the repo no longer has**, and the point-in-time join shows them under the right one:
+
+```sql
+join dim_repo_history h on h.repo_id = e.repo_id
+ and e.created_at >= h.valid_from and (e.created_at < h.valid_to or h.valid_to is null)
+```
+
+- **Built from events, not with `dbt snapshot`.** A snapshot only records what it sees when it runs. A backfill of October would have produced one row per repo, and lost history could never be rebuilt. Here, every rebuild reproduces the same history, and re-running a day leaves it byte-for-byte identical.
+- **Gaps and islands, not `group by name`.** 233 repos were renamed *back* (e.g. `homelab` → `homeprod` → `homelab`). Grouping by name would merge the two `homelab` periods into one that overlaps `homeprod`.
+- **Exact order.** [int_repo_name_segments](dbt/oss_pulse/models/intermediate/int_repo_name_segments.sql) compacts each day to runs of one name, ordered by `created_at` and then `event_id`, so ties within a second are deterministic. `dim_repo` uses the same tie-break.
+- **Tested:** exactly one current row per repo, periods that chain with no gap or overlap, the current name equal to `dim_repo`, and two unit tests (rename back, midnight continuation, same-second ties).
 
 ## Pipeline
 
@@ -213,7 +226,7 @@ Checks at every layer. A failure stops the run before bad data reaches the next 
 | Spark | Explicit schema; ≤ 1% corrupt/invalid rows; ≤ 1% rows outside the date; de-duplication on `event_id` | Exit 1, **nothing written** |
 | Load | `_SUCCESS` must exist; 0 rows loaded = error; BigQuery rejects rows from another date | Task fails; partition unchanged |
 | dbt sources | **Freshness**: `max(created_at)` warn > 26 h, error > 50 h | Run fails before building |
-| dbt models | **45 tests**: `unique` + `not_null` on every key; `unique_combination_of_columns` on the aggregates; `relationships` from `fct_events` to all 3 dims; `accepted_values` for the 16 event types and 24 hours; [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql); a **unit test** for `is_bot` (`dependabot[bot]`, `COPILOT` → bot; `abbot`, `octocat` → human) | A failing test **skips every downstream model** |
+| dbt models | **66 tests**: `unique` + `not_null` on every key; `unique_combination_of_columns` on the aggregates; `relationships` from `fct_events` to all 3 dims; SCD2 rules for `dim_repo_history` (one current row, periods chain, agrees with `dim_repo`); `accepted_values` for the 16 event types and 24 hours; [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql); **3 unit tests**: `is_bot` (`dependabot[bot]`, `COPILOT` → bot; `abbot`, `octocat` → human) and the SCD2 period logic | A failing test **skips every downstream model** |
 | Run | `audit.load_log`: status, rows loaded, failed tasks, run id | Failed runs are recorded and alerted |
 | Idempotency | `make chaos-test DAY=…` clears a finished day, re-runs it, compares 5 counts | Exit 1 if anything changed |
 
@@ -249,9 +262,9 @@ Every pull request runs [.github/workflows/ci.yml](.github/workflows/ci.yml). `m
 - `oss_pulse_ci` tables expire after a day. Runs share the dataset, so they're serialized (`concurrency`), and each starts with `--full-refresh`, so results never depend on a previous run.
 - A full CI run bills ~0.9 GiB of BigQuery (126 queries, mostly the 10 MB minimum each), so the free tier covers ~1,100 runs a month. A 2 GB per-query cap in the `ci` profile fails the build if the window ever breaks.
 
-**Slim CI on pull requests.** After every successful prod build, Airflow publishes dbt's `manifest.json` (`publish_dbt_manifest`). A PR's CI downloads it and runs
-`dbt build --select state:modified+ --defer --favor-state --state <prod manifest>`:
-- **Only the changed models and everything downstream are built.** Editing `agg_repo_daily` builds 14 nodes instead of 56, in 65 s instead of 123 s. A PR that doesn't touch dbt builds only 4 cheap tests (their `where:` config renders a var that CI overrides).
+**Slim CI on pull requests.** After every successful prod build, Airflow publishes dbt's `manifest.json` (`publish_dbt_manifest`). A PR's CI downloads it, lists the changed models with `dbt ls --select state:modified+`, and builds those with `--defer --favor-state --indirect-selection cautious`:
+- **Only the changed models and everything downstream are built.** Editing `agg_repo_daily` builds 14 nodes instead of 56, in 65 s instead of 123 s. A PR that doesn't touch dbt builds nothing.
+- **A test runs only if all its parents were built in CI** (`cautious`). Otherwise, changing `dim_repo` would run the relationships test from prod `fct_events` (all history) to a 2-day CI `dim_repo`: 26M false failures. dbt flags every test of a changed model as modified, so the model list must come from `dbt ls` first. The full build on `main` still runs those cross-environment tests.
 - **Unchanged parents are read from prod** (`--defer`), read-only, so a PR is tested against real upstream tables.
 - **`--favor-state` matters:** without it, dbt prefers a table that already exists in `oss_pulse_ci`. A previous run, possibly from another branch, may have left one there.
 - **No manifest yet** (new project): CI falls back to the full build.
