@@ -220,7 +220,8 @@ with DAG(
             '  echo "Historical run ({{ ds }}): freshness vs. now does not apply, skipping."\n'
             "  exit 0\n"
             "fi\n"
-            f'"$DBT_BIN" source freshness {DBT_FLAGS}\n'
+            # raw.events only: a stale GitHub enrichment must not fail the event pipeline.
+            f'"$DBT_BIN" source freshness {DBT_FLAGS} --select source:raw.events\n'
         ),
         execution_timeout=timedelta(minutes=10),
     )
@@ -236,6 +237,7 @@ with DAG(
         task_id="dbt_build",
         bash_command=f"\"$DBT_BIN\" build {DBT_FLAGS} --vars '{{run_date: {{{{ ds }}}}}}'",
         max_active_tis_per_dag=1,
+        pool="dbt",  # 1 slot, shared with oss_pulse_github: no two dbt builds at once
         execution_timeout=timedelta(minutes=45),
     )
 

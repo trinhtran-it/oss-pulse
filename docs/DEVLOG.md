@@ -2,6 +2,18 @@
 
 Short entries on things that broke, surprised me, or changed a decision. Newest first.
 
+## 2026-11-25: GitHub API enrichment: what the rate limits and ETags actually did
+
+Enrichment adds language and topics for the top 1,000 repos by stars (`GET /repositories/{id}`, by id because names change).
+
+- **Ranked "as of today", it found nothing.** My first default ranked stars over the 30 days up to *yesterday*. The pipeline stopped at 10-31, so that window held no stars. The job now ends the window at the **latest loaded day** (from partition metadata), the same rule the reports use.
+- **ETags saved less than I expected.** A forced refresh of the top 50 returned only 3 `304`s: trending repos change their star count all day, so their ETag changes. The quota dropped by exactly the 47 `200`s, which confirms a 304 is free. ETags would pay off on a long tail of quiet repos, not on the top of a trending list. The refresh-after-7-days cursor matters more: an immediate re-run fetched 0 repos.
+- **Isolation.** The API returns repos *as they are now*, so this is not a backfillable daily job. It got its own DAG with `catchup=False`. The event DAG's freshness check is now limited to `raw.events`, so a stale enrichment can't fail the data load, and an Airflow pool keeps the two DAGs' dbt builds from running at once.
+- **CI vs. 30-day rankings.** `dim_repo_github` → `dim_repo` is a real foreign key in prod, but CI builds `dim_repo` from 2 days. So the test is an error in prod and a warning in CI (162 repos outside the window).
+- **A BigQuery gotcha:** `sum(stars) as stars ... having sum(stars) > 0` fails with "aggregations of aggregations". In `HAVING`, `stars` resolves to the alias, so `having stars > 0` is the fix.
+
+Result: 1,000 repos in 8.7 min (982 ok, 18 deleted since October, 0 failed), using a fifth of the hourly quota. The top ~1,000 repos (1% of starred repos) received 33% of October's stars; Python and TypeScript lead.
+
 ## 2026-11-25: Repo history (SCD2): renames are common, and Slim CI nearly blocked the PR
 
 **The data.** I expected renames to be rare. In October, 42,422 repos (0.7%) had more than one name, and 233 were renamed *back* (`homelab` → `homeprod` → `homelab`). That ruled out two shortcuts:

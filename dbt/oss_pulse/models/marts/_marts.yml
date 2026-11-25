@@ -237,6 +237,8 @@ models:
         description: owner/name at the most recent event.
       - name: repo_url
         description: https://github.com/<repo_name>.
+      - name: language
+        description: Primary language from the GitHub API (dim_repo_github); NULL if not enriched yet.
       - name: stars
         description: Stars received in the window, bots excluded.
       - name: forks
@@ -303,6 +305,64 @@ models:
         description: Last event in this period (UTC).
       - name: events
         description: Events in this period, bots included.
+
+  - name: dim_repo_github
+    description: >
+      GitHub attributes of the enriched repositories (top 1,000 by stars over 30 days, refreshed
+      weekly by ingestion/github_repos.py): language, topics, license, all-time totals. One row
+      per repo_id; repos never enriched have no row, so join with a left join.
+    columns:
+      - name: repo_id
+        description: Foreign key to dim_repo.
+        data_tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_repo')
+                field: repo_id
+              config:
+                # CI builds dim_repo from 2 days, but repos are ranked over 30: warn there only.
+                severity: "{{ 'warn' if target.name == 'ci' else 'error' }}"
+      - name: github_full_name
+        description: owner/name when last fetched, lowercase (may lag dim_repo by up to a week).
+      - name: language
+        description: Primary language as detected by GitHub. NULL for repos without code.
+      - name: topics
+        description: Repository topics, lowercase.
+      - name: license_spdx
+        description: SPDX license id, e.g. MIT. NULL if none.
+      - name: stars_total
+        description: All-time stars according to GitHub at fetch time (not from events).
+      - name: is_available
+        description: FALSE if the latest call found the repo deleted, private or blocked.
+        data_tests: [not_null]
+      - name: last_status
+        description: Status of the latest API call.
+      - name: metadata_fetched_at
+        description: When the metadata in this row was fetched (UTC).
+      - name: last_checked_at
+        description: When the repo was last checked (UTC), including 304 and 404 answers.
+
+  - name: rpt_stars_by_language
+    description: >
+      Stars received over the latest 30 loaded days, bots excluded, by GitHub language of the
+      enriched repos. 'unknown' = no primary language; 'not enriched' = all other repos, so its
+      share_of_stars shows how much of the total the enriched repos cover.
+    columns:
+      - name: language
+        description: Lowercase GitHub language, 'unknown', or 'not enriched'.
+        data_tests: [unique, not_null]
+      - name: repos
+        description: Repositories with at least one star in the window.
+      - name: stars
+        description: Stars received in the window.
+      - name: share_of_stars
+        description: stars / all stars in the window (0-1); the column sums to 1.
+      - name: window_start
+        description: First day of the 30-day window (UTC).
+      - name: window_end
+        description: Last day of the window = latest day loaded in agg_repo_daily.
 
 unit_tests:
   - name: test_is_bot_flags_apps_and_known_bots_only

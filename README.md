@@ -17,7 +17,7 @@ Measured on the October 2026 backfill (2026-11-25). `make metrics` recomputes th
 | Raw data | **243 MiB/day** gzip on average, 529 MiB peak, 7.4 GiB for the month | GCS `raw/` |
 | End-to-end runtime | **8 min** median per day (ingest → Spark → load → dbt → audit) | Airflow metadata, 31 runs |
 | Partitioning + clustering | **−99.7%** bytes for the same query (290.7 MB → 0.9 MB) | [benchmark](#warehouse-bigquery-and-the-partitioning-decision) |
-| Tests | **45** dbt tests (incl. a unit test) + **88** Python tests; 6 CI jobs on every PR | [data quality](#data-quality), [CI/CD](#cicd) |
+| Tests | **76** dbt tests (incl. 3 unit tests) + **118** Python tests; 6 CI jobs on every PR | [data quality](#data-quality), [CI/CD](#cicd) |
 | Slim CI | Editing one model builds **14 of 56** nodes (65 s instead of 123 s) | [CI/CD](#cicd) |
 | Cloud cost | **≈ $2** for the month (BigQuery within the free tier) | [cost](#cost) |
 
@@ -74,6 +74,8 @@ A star schema in `oss_pulse_marts`, plus reporting tables built for the dashboar
 | `fct_events` | GitHub event | incremental `insert_overwrite`, partitioned by `event_date`, clustered by `event_type, repo_id` | 30.0M |
 | `dim_repo` | repository (`repo_id`, stable across renames) | incremental `merge`; latest name, first/last seen | 5.8M |
 | `dim_repo_history` | repository × period under one owner/name (**SCD Type 2**) | table, rebuilt daily from `int_repo_name_segments` | 5.89M |
+| `dim_repo_github` | enriched repository: language, topics, license from the GitHub API | table, from `stg_github_repos` | 1,000 |
+| `rpt_stars_by_language` | language (plus `not enriched`) over the latest 30 loaded days | table, rebuilt daily | ~40 |
 | `dim_actor` | account (`actor_id`) | incremental `merge`; latest login, `is_bot` | 3.6M |
 | `dim_date` | calendar day | table (`dbt_utils.date_spine`) | 457 |
 | `agg_repo_daily` | repo × day, **bots excluded** | incremental `insert_overwrite` | 9.1M |
@@ -145,6 +147,29 @@ https://data.gharchive.org/2026-10-01-15.json.gz
 | No partial files | The upload only becomes an object when the stream completes; a size mismatch against `Content-Length` deletes it and retries |
 | Logging | One JSON line per hour (`hour`, `status`, `bytes`, `duration_s`, `attempts`) plus a `run_summary`, e.g. `24/24 ok` |
 | Exit codes | `0` ok · `1` an hour failed · `2` usage/config error · `3` only missing hours (`--allow-missing` → 0) |
+
+### Enrichment (GitHub REST API → raw.github_repo_metadata)
+
+GH Archive events carry no repository attributes, so "which languages are trending?" can't be answered from them. [ingestion/github_repos.py](ingestion/github_repos.py) adds language, topics, license and totals for the **top 1,000 repos by stars** (latest 30 loaded days). It runs in its own DAG, [oss_pulse_github](airflow/dags/oss_pulse_github.py).
+
+| Behavior | Detail |
+|---|---|
+| Key | `GET /repositories/{repo_id}`, never by name: 0.7% of repos change name in a month ([SCD2](#data-model)) |
+| Incremental cursor | Only repos never fetched, or fetched more than 7 days ago; new ones first, then by stars. A run that stops early is continued by the next |
+| Rate limits | Sequential requests; stops cleanly at a reserve of 100, or when `X-RateLimit-Remaining` hits 0 (never sleeps for an hour); waits out secondary limits (`Retry-After`, capped at 2 min); retries 5xx with backoff |
+| Conditional requests | The stored `ETag` goes back as `If-None-Match`; a `304` costs no quota |
+| Storage | Append-only `raw.github_repo_metadata` via BigQuery load jobs (free), written in batches so progress survives a crash. `stg_github_repos` takes the latest answer per repo; deleted repos keep their metadata with `last_status = not_found` |
+| Token | Fine-grained, public repositories read-only, in the Airflow Variable `github_token_secret` (masked in logs). Without one, a run is capped at 50 calls (GitHub allows 60/hour) |
+| Isolation | A separate DAG (`catchup=False`: the API only knows "now"), so a GitHub outage can't fail the event load. Both DAGs' dbt tasks share the pool `dbt` (1 slot) |
+
+**First run:** 1,000 repos in 8.7 min, using 1,000 of the 5,000/hour quota. 982 `ok`, 18 `not_found` (deleted or made private since October), 0 failed. An immediate re-run selected 0 repos (the cursor). A forced refresh of the top 50 returned 3 `304`s, and the quota dropped by exactly the 47 `200`s.
+
+**What it shows** ([rpt_stars_by_language](dbt/oss_pulse/models/marts/rpt_stars_by_language.sql), last 30 days of October): the top ~1,000 repos, about 1% of the ~95k starred repos, received **33% of all stars**. Python leads with 8.5% of all stars, then TypeScript 8.1%, Rust 3.8% and JavaScript 3.6%. `rpt_top_repos_7d` now also shows each repo's language.
+
+```bash
+make enrich ARGS=--dry-run          # what would be fetched (as of the latest loaded day)
+make enrich                         # fetch, using AIRFLOW_VAR_GITHUB_TOKEN_SECRET from .env
+```
 
 ### Processing (Spark → processed/events)
 
@@ -241,7 +266,7 @@ Checks at every layer. A failure stops the run before bad data reaches the next 
 | Spark | Explicit schema; ≤ 1% corrupt/invalid rows; ≤ 1% rows outside the date; de-duplication on `event_id` | Exit 1, **nothing written** |
 | Load | `_SUCCESS` must exist; 0 rows loaded = error; BigQuery rejects rows from another date | Task fails; partition unchanged |
 | dbt sources | **Freshness**: `max(created_at)` warn > 26 h, error > 50 h | Run fails before building |
-| dbt models | **66 tests**: `unique` + `not_null` on every key; `unique_combination_of_columns` on the aggregates; `relationships` from `fct_events` to all 3 dims; SCD2 rules for `dim_repo_history` (one current row, periods chain, agrees with `dim_repo`); `accepted_values` for the 16 event types and 24 hours; [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql); **3 unit tests**: `is_bot` (`dependabot[bot]`, `COPILOT` → bot; `abbot`, `octocat` → human) and the SCD2 period logic | A failing test **skips every downstream model** |
+| dbt models | **76 tests**: `unique` + `not_null` on every key; `unique_combination_of_columns` on the aggregates; `relationships` from `fct_events` to all 3 dims; SCD2 rules for `dim_repo_history` (one current row, periods chain, agrees with `dim_repo`); `accepted_values` for the 16 event types and 24 hours; [assert_no_negative_counts](dbt/oss_pulse/tests/assert_no_negative_counts.sql); **3 unit tests**: `is_bot` (`dependabot[bot]`, `COPILOT` → bot; `abbot`, `octocat` → human) and the SCD2 period logic | A failing test **skips every downstream model** |
 | Run | `audit.load_log`: status, rows loaded, failed tasks, run id | Failed runs are recorded and alerted |
 | Idempotency | `make chaos-test DAY=…` clears a finished day, re-runs it, compares 5 counts | Exit 1 if anything changed |
 
@@ -264,7 +289,7 @@ Every pull request runs [.github/workflows/ci.yml](.github/workflows/ci.yml). `m
 
 | Check (job) | What it catches | Credentials |
 |---|---|---|
-| `python (ruff + pytest)` | Lint, formatting, 88 unit tests (ingestion, Spark on a local JVM, alerts); builds the ingestion image | none |
+| `python (ruff + pytest)` | Lint, formatting, 118 unit tests (ingestion, GitHub API client, Spark on a local JVM, alerts); builds the ingestion image | none |
 | `sql lint (sqlfluff)` | Style and ambiguity in dbt SQL, as inline PR annotations | none |
 | `terraform (fmt + validate)` | Unformatted or invalid Terraform | none |
 | `secret scan (gitleaks)` | Keys and tokens anywhere in the git history (pinned release, checksum verified) | none |
@@ -323,7 +348,7 @@ Then, in **Settings → Branches**, protect `main`: require a pull request, and 
 # 1. Get the code and the Python environment
 git clone https://github.com/trinhtran-it/oss-pulse.git && cd oss-pulse
 make setup                      # .venv with all deps + dbt packages
-make test lint                  # 88 tests, no cloud access needed
+make test lint                  # 118 tests, no cloud access needed
 
 # 2. Configure: .env is the only file to edit
 cp .env.example .env
@@ -400,6 +425,7 @@ What this project actually used from 2026-11-01 to 11-19. That covers every deve
 | **"Marts only" for the dashboard is a convention** | The dashboard credential (my account) could read `raw` | Service account with `dataViewer` on `oss_pulse_marts` only | ~30 min of Terraform, free |
 | **CI builds a fixed 2-day window** (Oct 30–31) | A bug that only shows on other days' data passes CI | Pick the latest loaded days via `INFORMATION_SCHEMA.PARTITIONS`, or add a weekly wider build | ~1 h, ~free |
 | **No CD for infrastructure or the Spark job** | `terraform apply` and `make spark-upload` are run by hand after merging | A `main`-only job: `terraform plan` on PRs, `apply` + `spark-upload` after merge, with its own narrowly-scoped service account | ~half a day, free |
+| **Enrichment covers the top 1,000 repos only** | Language is known for repos that get 33% of stars; the long tail shows as `not enriched` | Raise `--top-n` (5,000/hour allows ~100k repos a day), or use the GraphQL API to fetch 100 repos per call | free, ~1 h |
 | **Spark runs one day at a time** | A month's backfill takes hours | Raise the `CPUS_ALL_REGIONS` quota to 24+ | free (quota request) |
 
 ## Repository layout
