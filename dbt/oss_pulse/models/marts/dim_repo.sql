@@ -12,6 +12,7 @@
 with window_events as (
 
     select
+        event_id,
         repo_id,
         repo_name,
         repo_owner,
@@ -27,8 +28,11 @@ repos_in_window as (
 
     select
         repo_id,
-        -- the name at the most recent event: repos can be renamed or transferred
-        array_agg(struct(repo_name, repo_owner) order by created_at desc limit 1)[offset(0)] as latest,
+        -- the name at the most recent event: repos can be renamed or transferred. event_id breaks
+        -- ties within a second, the same order dim_repo_history uses, so the two always agree.
+        array_agg(
+            struct(repo_name, repo_owner) order by created_at desc, event_id desc limit 1
+        )[offset(0)] as latest,
         min(created_at) as first_seen_at,
         max(created_at) as last_seen_at
     from window_events

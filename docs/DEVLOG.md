@@ -2,6 +2,18 @@
 
 Short entries on things that broke, surprised me, or changed a decision. Newest first.
 
+## 2026-11-25: Repo history (SCD2): renames are common, and Slim CI nearly blocked the PR
+
+**The data.** I expected renames to be rare. In October, 42,422 repos (0.7%) had more than one name, and 233 were renamed *back* (`homelab` → `homeprod` → `homelab`). That ruled out two shortcuts:
+- **`dbt snapshot` on `dim_repo`.** It records only what it sees at run time. A backfill of October would have stored one row per repo, and a lost snapshot table could never be rebuilt. `dim_repo_history` is derived from events instead, so a rebuild or a re-run reproduces it byte-for-byte (I compared fingerprints).
+- **`group by repo_id, repo_name`.** It would merge both `homelab` periods into one that overlaps `homeprod`. Gaps and islands (a new period whenever the name differs from the previous event) gets it right.
+
+**Ties.** `dim_repo` took the "latest name" with `order by created_at desc`. With two events in the same second it picked at random, and 1 repo of 5.8M disagreed with the new history. Both now order by `created_at`, then `event_id`, and a singular test checks they agree. Deploy note: prod `dim_repo` needs one `--full-refresh` to adopt the tie-break.
+
+**Slim CI would have failed this PR with 26M false failures.** Changing `dim_repo` selects its children, and dbt also flags the relationships test `fct_events -> dim_repo` as modified. With `--defer`, that test compared prod `fct_events` (all of October) with a 2-day CI `dim_repo`. `--indirect-selection cautious` is meant for this, but dbt ignores it for tests that a selector matches directly, and `state:modified+` matches them. The fix is two steps: `dbt ls` lists the changed models, then `dbt build --select <those names> --indirect-selection cautious` runs only tests whose parents were all built in CI. The full build on main still runs the cross-environment tests. I also found that the first version swallowed a failing `dbt ls` (a pipe into `tr`) and reported "no changed models"; `pipefail` fixed that.
+
+Result: 66 dbt tests (3 unit tests). Slim CI builds 32 nodes for this PR, the full CI build 79, and both pass.
+
 ## 2026-11-25: Slim CI, and the flag that makes `--defer` trustworthy
 
 A pull request's CI now builds only what changed: `dbt build --select state:modified+ --defer --state <prod manifest>`. Airflow publishes the prod manifest after every successful build. Three things I only learned by testing:

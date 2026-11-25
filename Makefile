@@ -232,8 +232,8 @@ dbt-deps: ## Install dbt packages (dbt_utils)
 dbt-debug: ## Check the dbt connection to BigQuery
 	$(DBT) debug $(DBT_FLAGS)
 
-dbt-build: ## Models + tests [DBT_TARGET=dev|prod] [RUN_DATE=YYYY-MM-DD] [DBT_SELECT=...]
-	$(DBT) build $(DBT_FLAGS) $(DBT_VARS) $(DBT_SEL)
+dbt-build: ## Models + tests [DBT_TARGET=dev|prod] [RUN_DATE=...] [DBT_SELECT=...] [DBT_EXTRA=--full-refresh]
+	$(DBT) build $(DBT_FLAGS) $(DBT_VARS) $(DBT_SEL) $(DBT_EXTRA)
 
 dbt-test:
 	$(DBT) test $(DBT_FLAGS) $(DBT_VARS) $(DBT_SEL)
@@ -254,17 +254,30 @@ dbt-ci: ## The CI dbt builds, in the oss_pulse_ci dataset (needs the CI Terrafor
 PROD_STATE := dbt/oss_pulse/target/prod-state
 # --favor-state: always read unchanged parents from prod, even if an older CI run left a copy in
 # oss_pulse_ci (it could be another branch's version). --state must be absolute.
-SLIM := --select state:modified+ --defer --favor-state --state $(CURDIR)/$(PROD_STATE)
+# What a pull request builds, in two steps:
+#  1. `dbt ls` lists changed models/seeds and everything downstream (state:modified+);
+#  2. `dbt build` selects those by name with `--indirect-selection cautious`, so a test runs only
+#     if ALL its parents were built here. A selector like state:modified+ also picks tests of
+#     unchanged models, e.g. relationships fct_events -> dim_repo when dim_repo changes: prod
+#     fct_events (all history) vs. a 2-day CI dim_repo = 26M false failures. (cautious is ignored
+#     for tests matched directly, so the names must come from step 1.) Mixed tests still run in
+#     the full build on main. Singular and unit tests that changed themselves are added directly.
+# --defer --favor-state: read unchanged parents from prod, never from an older CI run's leftovers.
+STATE_FLAGS = --state $(CURDIR)/$(PROD_STATE)
+CI_FLAGS    = --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci
 dbt-ci-slim: ## CI dbt builds, only for models changed vs. prod (falls back to dbt-ci)
-	@rc=0; $(PY) dbt/scripts/prod_manifest.py download $(PROD_STATE) || rc=$$?; \
-	if [ $$rc -eq 3 ]; then echo "No prod manifest yet: full CI build"; $(MAKE) --no-print-directory dbt-ci; \
-	elif [ $$rc -ne 0 ]; then exit $$rc; \
-	else \
-		$(DBT) build --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci \
-			--full-refresh --vars '$(CI_VARS)' $(SLIM) && \
-		$(DBT) build --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci \
-			--vars '$(CI_VARS)' $(SLIM); \
-	fi
+	@set -o pipefail; rc=0; $(PY) dbt/scripts/prod_manifest.py download $(PROD_STATE) || rc=$$?; \
+	if [ $$rc -eq 3 ]; then echo "No prod manifest yet: full CI build"; $(MAKE) --no-print-directory dbt-ci; exit; fi; \
+	if [ $$rc -ne 0 ]; then exit $$rc; fi; \
+	models=$$($(DBT) --quiet ls $(CI_FLAGS) $(STATE_FLAGS) --select state:modified+ \
+		--resource-type model --resource-type seed --output name | tr '\n' ' ') || exit $$?; \
+	echo "Slim CI, changed models and children: $${models:-none}"; \
+	for mode in --full-refresh ""; do \
+		$(DBT) build $(CI_FLAGS) $$mode --vars '$(CI_VARS)' $(STATE_FLAGS) --defer --favor-state \
+			--indirect-selection cautious \
+			--select $$models state:modified,test_type:singular state:modified,resource_type:unit_test \
+			|| exit $$?; \
+	done
 
 # Airflow publishes the manifest after every prod build (publish_dbt_manifest). Use this once,
 # before the first Airflow run, or to reset Slim CI's baseline to the current code.

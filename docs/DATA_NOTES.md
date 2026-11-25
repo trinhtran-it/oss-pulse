@@ -93,6 +93,21 @@ Spark should flatten to these columns, using an **explicit schema** rather than 
 
 Keep these rules in one dbt model (`int_events_classified`) instead of repeating them in each mart. Put the event-type-to-category mapping in the `event_types` seed.
 
+## Renames and transfers
+
+Repositories change name and owner far more often than I expected: in October 2026, **42,422 repos (0.7%) appeared under more than one `owner/name`**. `repo_id` is the only stable key.
+
+| Change | Periods | Example |
+|---|---|---|
+| Renamed (same owner) | 31,192 | `owner/myia` → `owner/shishi` → `owner/myssia` → `owner/myia` |
+| Transferred (same name) | 10,511 | moved to another user or an organization |
+| Both | 2,508 | |
+
+- 99.5% are clean sequences (A → B → C). **233 repos were renamed back** to an earlier name (A → B → A), and one repo had 11 names in a month. These are real changes, not noise: the timelines are hours or days apart.
+- GH Archive has no rename event. A rename is only visible as the first event under the new name, so the exact time is only known to fall between two events.
+- Two events in the same second can carry different names. Ordering by `created_at` alone is then ambiguous; `event_id` breaks the tie (this changed the "latest name" of 1 repo out of 5.8M).
+- Consequence: `dim_repo` keeps the latest name; `dim_repo_history` (SCD2) keeps every period. 1.4% of events happened under a name the repo no longer has.
+
 ## Data-quality issues
 
 **Bots**

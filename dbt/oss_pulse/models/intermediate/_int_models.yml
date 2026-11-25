@@ -13,3 +13,57 @@ models:
                 where: "created_at >= timestamp('{{ var('history_start_date') }}')"
       - name: is_bot
         description: See macros/is_bot.sql.
+
+  - name: int_repo_name_segments
+    description: >
+      One row per repo_id x event_date x continuous run of events under one name (gaps and islands).
+      Compact daily input for dim_repo_history. Incremental insert_overwrite on event_date.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_date, repo_id, run_number]
+    columns:
+      - name: event_date
+        description: UTC day (partition column).
+        data_tests: [not_null]
+      - name: repo_id
+        data_tests: [not_null]
+      - name: run_number
+        description: 1, 2, ... in event order within the day (created_at, then event_id for ties).
+        data_tests: [not_null]
+      - name: repo_name
+        description: owner/name during this run, lowercase.
+        data_tests: [not_null]
+      - name: first_seen_at
+        description: First event of the run (UTC).
+      - name: last_seen_at
+        description: Last event of the run (UTC).
+      - name: events
+        description: Events in the run.
+
+unit_tests:
+  - name: test_name_runs_follow_event_order_and_break_ties_by_event_id
+    description: >
+      A -> B -> A on one day is 3 runs, not 2. Two events in the same second are ordered by
+      event_id, so the run boundaries never depend on BigQuery's row order.
+    model: int_repo_name_segments
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        history_start_date: "2026-10-01"
+        run_date: "2026-10-01"
+    given:
+      - input: ref('int_events_enriched')
+        rows:
+          - { event_id: "1", repo_id: 7, repo_name: "a/x", event_date: "2026-10-01", created_at: "2026-10-01 10:00:00" }
+          - { event_id: "2", repo_id: 7, repo_name: "a/x", event_date: "2026-10-01", created_at: "2026-10-01 11:00:00" }
+          - { event_id: "4", repo_id: 7, repo_name: "a/y", event_date: "2026-10-01", created_at: "2026-10-01 12:00:00" }
+          - { event_id: "3", repo_id: 7, repo_name: "a/x", event_date: "2026-10-01", created_at: "2026-10-01 12:00:00" }
+          - { event_id: "5", repo_id: 7, repo_name: "a/x", event_date: "2026-10-01", created_at: "2026-10-01 13:00:00" }
+    expect:
+      rows:
+        # event 3 (a/x) sorts before event 4 (a/y) at 12:00:00, so a/x continues until 12:00
+        - { repo_id: 7, run_number: 1, repo_name: "a/x", first_seen_at: "2026-10-01 10:00:00", last_seen_at: "2026-10-01 12:00:00", events: 3 }
+        - { repo_id: 7, run_number: 2, repo_name: "a/y", first_seen_at: "2026-10-01 12:00:00", last_seen_at: "2026-10-01 12:00:00", events: 1 }
+        - { repo_id: 7, run_number: 3, repo_name: "a/x", first_seen_at: "2026-10-01 13:00:00", last_seen_at: "2026-10-01 13:00:00", events: 1 }
