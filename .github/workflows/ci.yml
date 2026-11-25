@@ -31,7 +31,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: "**/requirements*.txt"
-      - uses: actions/setup-java@v4 # Spark tests need a JVM
+      - uses: actions/setup-java@v6 # Spark tests need a JVM
         with:
           distribution: temurin
           java-version: "17"
