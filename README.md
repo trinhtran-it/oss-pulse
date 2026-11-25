@@ -170,7 +170,7 @@ The load job replaces exactly one partition (`events$YYYYMMDD`, `WRITE_TRUNCATE`
 [oss_pulse_daily.py](airflow/dags/oss_pulse_daily.py) runs one UTC day per run:
 
 ```
-ingest_raw → spark_flatten → load_bq_partition → dbt_source_freshness → dbt_build → record_audit
+ingest_raw → spark_flatten → load_bq_partition → dbt_source_freshness → dbt_build → publish_dbt_manifest → record_audit
 ```
 
 | Task | How it runs | Why it is safe to re-run |
@@ -180,6 +180,7 @@ ingest_raw → spark_flatten → load_bq_partition → dbt_source_freshness → 
 | `load_bq_partition` | Checks `_SUCCESS`, then a load job into `raw.events$<ds_nodash>` | `WRITE_TRUNCATE` on one partition is atomic |
 | `dbt_source_freshness` | Only when the day ended < 2 days ago (backfills skip it) | Read-only |
 | `dbt_build` | `dbt build --target prod --vars '{run_date: <ds>}'` | `insert_overwrite` and `merge` |
+| `publish_dbt_manifest` | Uploads the build's `manifest.json` to `gs://<bucket>/dbt/prod/`: Slim CI's baseline | Overwrites one object |
 | `record_audit` | `trigger_rule=all_done` → `oss_pulse_audit.load_log` | Append-only: one row per attempt |
 
 **Design decisions.**
@@ -240,18 +241,28 @@ Every pull request runs [.github/workflows/ci.yml](.github/workflows/ci.yml). `m
 | `terraform (fmt + validate)` | Unformatted or invalid Terraform | none |
 | `secret scan (gitleaks)` | Keys and tokens anywhere in the git history (pinned release, checksum verified) | none |
 | `airflow (DAG import)` | DAG import errors inside the real Airflow image | none |
-| `dbt (build on BigQuery)` | SQL that compiles but fails or breaks a test on real data. Runs a 2-day **full build** of every model and test in `oss_pulse_ci`, then the **daily incremental path** on top of it | Workload Identity Federation |
+| `dbt (build on BigQuery)` | SQL that compiles but fails or breaks a test on real data. Builds 2026-10-30..31 in `oss_pulse_ci`, then re-runs the **daily incremental path** on top. Pull requests use **Slim CI** (below); pushes to `main` build everything | Workload Identity Federation |
 
 **No GCP key in GitHub.** The dbt job asks GitHub for a short-lived OIDC token, and [google-github-actions/auth](https://github.com/google-github-actions/auth) exchanges it for a ~1-hour credential of the `oss-pulse-ci` service account ([terraform/ci.tf](terraform/ci.tf)):
 - The identity pool only accepts tokens whose `repository` is this repo. Pull requests from forks get no token, and the dbt build is skipped for them.
 - The service account can run BigQuery jobs, read `oss_pulse_raw` and write `oss_pulse_ci`. Nothing else: no access to the marts, the bucket or Dataproc.
 - `oss_pulse_ci` tables expire after a day. Runs share the dataset, so they're serialized (`concurrency`), and each starts with `--full-refresh`, so results never depend on a previous run.
-- Each CI run bills ~0.9 GiB of BigQuery (126 queries, mostly the 10 MB minimum each), so the free tier covers ~1,100 runs a month. A 2 GB per-query cap in the `ci` profile fails the build if the window ever breaks.
+- A full CI run bills ~0.9 GiB of BigQuery (126 queries, mostly the 10 MB minimum each), so the free tier covers ~1,100 runs a month. A 2 GB per-query cap in the `ci` profile fails the build if the window ever breaks.
+
+**Slim CI on pull requests.** After every successful prod build, Airflow publishes dbt's `manifest.json` (`publish_dbt_manifest`). A PR's CI downloads it and runs
+`dbt build --select state:modified+ --defer --favor-state --state <prod manifest>`:
+- **Only the changed models and everything downstream are built.** Editing `agg_repo_daily` builds 14 nodes instead of 56, in 65 s instead of 123 s. A PR that doesn't touch dbt builds only 4 cheap tests (their `where:` config renders a var that CI overrides).
+- **Unchanged parents are read from prod** (`--defer`), read-only, so a PR is tested against real upstream tables.
+- **`--favor-state` matters:** without it, dbt prefers a table that already exists in `oss_pulse_ci`. A previous run, possibly from another branch, may have left one there.
+- **No manifest yet** (new project): CI falls back to the full build.
+- **Least privilege:** the CI service account can read only `gs://<bucket>/dbt/prod/`, via an IAM condition. Its prod access is read-only (`dataViewer` on staging and marts).
 
 **Run the same checks locally:**
 ```bash
 make ci-local      # ruff, sqlfluff, pytest, terraform fmt/validate, gitleaks (no cloud access)
-make dbt-ci        # the two CI dbt builds, with your own credentials
+make dbt-ci        # the two full CI dbt builds, with your own credentials
+make dbt-ci-slim   # what a pull request runs: only what changed vs. prod
+make dbt-publish-manifest   # set Slim CI's baseline from this checkout (Airflow does it daily)
 ```
 
 **Set it up on your fork** (once, after `make infra-up` with `GITHUB_REPOSITORY=<owner>/<repo>` in `.env`):
@@ -260,6 +271,7 @@ gh variable set GCP_PROJECT_ID         --body "<your-project-id>"
 gh variable set GCP_REGION             --body "<your-region>"
 gh variable set GCP_WIF_PROVIDER       --body "$(terraform -chdir=terraform output -raw ci_workload_identity_provider)"
 gh variable set GCP_CI_SERVICE_ACCOUNT --body "$(terraform -chdir=terraform output -raw ci_service_account_email)"
+gh variable set GCS_BUCKET             --body "<your-bucket>"     # Slim CI reads the prod manifest here
 ```
 Then, in **Settings → Branches**, protect `main`: require a pull request, and require the six checks above to pass. These are repository *variables*, not secrets. None of them grants access on its own; access comes from the identity pool's repository condition.
 
