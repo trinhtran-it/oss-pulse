@@ -25,14 +25,19 @@ digraph architecture {
       staging [label=<<b>oss_pulse_staging</b><br/><font point-size="9">stg + int views, seeds</font>>]
       marts   [label=<<b>oss_pulse_marts</b><br/><font point-size="9">fct_events, dim_repo/actor/date<br/>agg_repo_daily, agg_events_hourly<br/>rpt_top_repos_7d</font>>,
                fillcolor="#E8F5EC", color="#3F8F5A"]
+      ghmeta  [label=<<b>oss_pulse_raw.github_repo_metadata</b><br/><font point-size="9">append-only API answers</font>>,
+               shape=cylinder, fillcolor="white"]
       audit   [label=<<b>oss_pulse_audit.load_log</b><br/><font point-size="9">one row per run</font>>, fillcolor="white"]
     }
   }
 
+  github [label=<<b>GitHub REST API</b><br/><font point-size="9">top 1,000 repos: language, topics</font>>,
+          shape=cylinder, fillcolor="white"]
+
   looker [label=<<b>Looker Studio</b><br/><font point-size="9">reads 2 small marts only</font>>,
           fillcolor="#FFF4E5", color="#B7791F"]
 
-  airflow [label=<<b>Airflow 3</b> (Docker)<br/><font point-size="9">oss_pulse_daily: one UTC day per run<br/>retries, alerts, catchup/backfill</font>>,
+  airflow [label=<<b>Airflow 3</b> (Docker)<br/><font point-size="9">oss_pulse_daily: one UTC day per run<br/>oss_pulse_github: daily enrichment<br/>retries, alerts, shared dbt pool</font>>,
            fillcolor="#EEEAF7", color="#6B5BA8"]
 
   gharchive -> raw       [label="① ingest_raw\nstream, no local disk"]
@@ -43,10 +48,16 @@ digraph architecture {
   staging   -> marts
   marts     -> looker
   airflow   -> audit     [label="⑥ record_audit", style=dashed, color="#6B5BA8", fontcolor="#6B5BA8"]
+  // drawn GitHub -> table; declared the other way so the API sits right of the table
+  ghmeta    -> github    [label="oss_pulse_github DAG\nweekly per repo, ETag", style=dashed, dir=back]
+  ghmeta    -> staging   [style=dashed]
 
   // Two rows: files on top, warehouse below; Airflow drives both.
   { rank=same; gharchive; raw; spark; processed }
   { rank=same; bqraw; staging; marts; looker }
-  { rank=same; airflow; audit }
+  // bottom row, left to right: Airflow | audit table, GitHub table | GitHub API
+  { rank=same; airflow; audit; ghmeta; github }
+  audit -> ghmeta [style=invis]
+  gharchive -> airflow [style=invis, weight=10]  // keep Airflow in the left column
   bqraw -> audit [style=invis]
 }

@@ -109,7 +109,7 @@ jobs:
           from airflow.dag_processing.dagbag import DagBag
           bag = DagBag('/opt/airflow/dags')
           assert not bag.import_errors, bag.import_errors
-          assert 'oss_pulse_daily' in bag.dags, sorted(bag.dags)
+          assert {'oss_pulse_daily', 'oss_pulse_github'} <= set(bag.dags), sorted(bag.dags)
           print('DAGs OK:', sorted(bag.dags))
           "
 

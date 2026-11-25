@@ -22,3 +22,18 @@ models:
                 where: "created_at >= timestamp('{{ var('history_start_date') }}')"
       - name: created_at
         description: Event time, UTC.
+
+  - name: stg_github_repos
+    description: >
+      One row per enriched repository: the latest GitHub API answer from raw.github_repo_metadata.
+      Metadata from the latest successful call; last_status / last_checked_at from the latest call.
+    columns:
+      - name: repo_id
+        data_tests: [unique, not_null]
+      - name: last_status
+        description: Status of the latest call (ok, not_modified, not_found, blocked).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [ok, not_modified, not_found, blocked]
