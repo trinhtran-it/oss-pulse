@@ -5,7 +5,8 @@
 # for that run. No long-lived key exists anywhere, so there is nothing to leak or rotate.
 #
 # Everything here is skipped when github_repository is empty (forks without CI set up).
-# The CI service account can only: run BigQuery jobs, read oss_pulse_raw, write oss_pulse_ci.
+# The CI service account can only: run BigQuery jobs, write oss_pulse_ci, read oss_pulse_raw,
+# read prod staging/marts (dbt --defer) and read gs://<lake>/dbt/prod/ (the prod manifest).
 
 locals {
   ci_enabled = var.github_repository != ""
@@ -99,4 +100,30 @@ resource "google_service_account_iam_member" "ci_wif_user" {
   service_account_id = google_service_account.ci[0].name
   role               = "roles/iam.workloadIdentityUser"
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github[0].name}/attribute.repository/${var.github_repository}"
+}
+
+# --- Slim CI: compare pull requests with prod (dbt state:modified+ --defer) ----------------------
+
+# Read the prod manifest that Airflow publishes, and nothing else in the lake bucket.
+resource "google_storage_bucket_iam_member" "ci_prod_manifest_reader" {
+  count = local.ci_enabled ? 1 : 0
+
+  bucket = google_storage_bucket.lake.name
+  role   = "roles/storage.objectViewer"
+  member = google_service_account.ci[0].member
+
+  condition {
+    title       = "dbt-prod-state-only"
+    description = "Only objects under dbt/prod/ (the prod manifest for Slim CI)."
+    expression  = "resource.name.startsWith(\"projects/_/buckets/${google_storage_bucket.lake.name}/objects/dbt/prod/\")"
+  }
+}
+
+# --defer reads unchanged parents from prod instead of rebuilding them: read-only, never write.
+resource "google_bigquery_dataset_iam_member" "ci_prod_viewer" {
+  for_each = local.ci_enabled ? toset(["staging", "marts"]) : toset([])
+
+  dataset_id = google_bigquery_dataset.this[each.key].dataset_id
+  role       = "roles/bigquery.dataViewer"
+  member     = google_service_account.ci[0].member
 }

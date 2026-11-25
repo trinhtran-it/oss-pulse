@@ -130,6 +130,7 @@ jobs:
       DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'ci-placeholder' }}
       GCP_REGION: ${{ vars.GCP_REGION }}
+      GCS_BUCKET: ${{ vars.GCS_BUCKET }} # where Airflow publishes the prod manifest (Slim CI)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -161,10 +162,19 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
-      # Same commands as `make dbt-ci`: a 2-day full build, then the daily incremental path.
+      # Pull requests: Slim CI, only models changed vs. prod (state:modified+) and their children;
+      # unchanged parents are read from prod (--defer --favor-state). Pushes to main and manual
+      # runs: everything. Both build 2026-10-30..31, then re-run the daily incremental path.
       - name: dbt build --target ci (2026-10-30 .. 10-31)
         if: steps.cloud.outputs.enabled == 'true'
-        run: make dbt-ci DBT=dbt
+        env:
+          SLIM: ${{ github.event_name == 'pull_request' && vars.GCS_BUCKET != '' }}
+        run: |
+          if [ "$SLIM" = "true" ]; then
+            make dbt-ci-slim DBT=dbt PY=python
+          else
+            make dbt-ci DBT=dbt
+          fi
       - name: keep dbt results
         if: always() && steps.cloud.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
