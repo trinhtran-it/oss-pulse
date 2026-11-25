@@ -64,7 +64,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
       - name: fmt + validate (no credentials, no remote state)
         working-directory: terraform
         run: |
