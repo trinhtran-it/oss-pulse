@@ -10,7 +10,10 @@ with events as (
 
 event_types as (
 
-    select event_type, category from {{ ref('event_type_lookup') }}
+    select
+        event_type,
+        category
+    from {{ ref('event_type_lookup') }}
 
 )
 

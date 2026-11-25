@@ -1,30 +1,99 @@
 name: ci
 
+# Every pull request must pass these checks before merging into main (branch protection).
+# `make ci-local` runs the same checks locally, except the BigQuery build (`make dbt-ci`).
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read # jobs that need more ask for it themselves
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # a new push supersedes the old run
+
+env:
+  PYTHON_VERSION: "3.11"
+  GITLEAKS_VERSION: "8.30.1"
 
 jobs:
   python:
+    name: python (ruff + pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: "**/requirements*.txt"
       - uses: actions/setup-java@v4 # Spark tests need a JVM
         with:
           distribution: temurin
           java-version: "17"
       - run: pip install -r requirements-dev.txt
-      - run: ruff check . && ruff format --check .
+      - run: ruff check --output-format=github .
+      - run: ruff format --check .
       - run: pytest
       - name: build ingestion image
         run: docker build -f ingestion/Dockerfile -t oss-pulse-ingestion .
 
-  airflow:
+  sql-lint:
+    name: sql lint (sqlfluff)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: "**/requirements*.txt"
+      - run: pip install -r <(grep '^sqlfluff' requirements-dev.txt) # same pin as local
+      # Jinja templater + stubs (dbt/oss_pulse/sqlfluff_libs): renders models without BigQuery.
+      - run: sqlfluff lint models tests --format github-annotation-native
+        working-directory: dbt/oss_pulse
+
+  terraform:
+    name: terraform (fmt + validate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: fmt + validate (no credentials, no remote state)
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # scan every commit, not just the last one
+      - name: install gitleaks (pinned release, checksum verified)
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "$base/$tarball"
+          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " $tarball\$" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+      - name: scan git history
+        run: ./gitleaks git . --redact --no-banner --verbose
+
+  airflow:
+    name: airflow (DAG import)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: build Airflow image
@@ -45,43 +114,63 @@ jobs:
           "
 
   dbt:
+    name: dbt (build on BigQuery)
+    needs: [python, sql-lint]
     runs-on: ubuntu-latest
-    needs: python
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC token for Workload Identity Federation (no JSON key)
+    # All runs share the oss_pulse_ci dataset: run one at a time, never cancel a build midway.
+    concurrency:
+      group: dbt-ci-dataset
+      cancel-in-progress: false
+    env:
+      DBT_TARGET: ci
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'ci-placeholder' }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: dbt/requirements.txt
       - run: pip install -r dbt/requirements.txt
-      # Static checks, no GCP credentials needed: Jinja, refs, YAML, tests and unit-test definitions.
+      # Static checks, no credentials: Jinja, refs, YAML, tests and unit-test definitions.
       - name: dbt deps + parse
-        env:
-          GCP_PROJECT_ID: ci-placeholder
-          DBT_TARGET: ci
         run: |
           dbt deps --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse
           dbt parse --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse
-      # TODO (orchestration step): with Workload Identity Federation, run
-      #   dbt build --target ci --empty   (schema-only build + unit tests in oss_pulse_ci)
-
-  terraform:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-      - name: fmt + validate (no credentials needed)
+      # Pull requests from forks get no OIDC token and must not reach the project's BigQuery.
+      - name: is BigQuery access configured?
+        id: cloud
+        env:
+          WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          FROM_FORK: ${{ github.event.pull_request.head.repo.fork == true }}
         run: |
-          terraform fmt -check -recursive
-          terraform init -backend=false -input=false
-          terraform validate
-        working-directory: terraform
-      # Plan needs GCP auth + remote state. Enable by setting repo variable TF_PLAN_ENABLED=true
-      # once Workload Identity Federation is configured (TODO: add google-github-actions/auth step).
-      - name: plan
-        if: vars.TF_PLAN_ENABLED == 'true'
-        run: |
-          terraform init -input=false -reconfigure \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=oss-pulse/dev"
-          terraform plan -input=false -lock=false \
-            -var="project_id=${{ vars.GCP_PROJECT_ID }}" -var="bucket_name=${{ vars.GCS_BUCKET }}"
-        working-directory: terraform
+          if [ -n "$WIF_PROVIDER" ] && [ "$FROM_FORK" != "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::dbt build skipped: set repo variables GCP_PROJECT_ID, GCP_REGION, GCP_WIF_PROVIDER, GCP_CI_SERVICE_ACCOUNT (README > CI/CD)"
+          fi
+      - name: authenticate to GCP (Workload Identity Federation)
+        if: steps.cloud.outputs.enabled == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+      # Same commands as `make dbt-ci`: a 2-day full build, then the daily incremental path.
+      - name: dbt build --target ci (2026-10-30 .. 10-31)
+        if: steps.cloud.outputs.enabled == 'true'
+        run: make dbt-ci DBT=dbt
+      - name: keep dbt results
+        if: always() && steps.cloud.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-ci-results
+          path: |
+            dbt/oss_pulse/target/run_results.json
+            dbt/oss_pulse/logs/dbt.log
+          retention-days: 7

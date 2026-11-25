@@ -33,7 +33,7 @@ with repo_totals as (
     {%- if window_end %}
     where event_date between date_sub(date '{{ window_end }}', interval 6 day) and date '{{ window_end }}'
     {%- else %}
-    where false  -- nothing loaded yet
+        where false  -- nothing loaded yet
     {%- endif %}
     group by repo_id
 
@@ -44,7 +44,7 @@ top_repos as (
     select
         *,
         -- ties broken by repo_id so the ranking is deterministic
-        row_number() over (order by stars desc, repo_id) as stars_rank
+        row_number() over (order by stars desc, repo_id asc) as stars_rank
     from repo_totals
     where stars > 0
     qualify stars_rank <= 10
@@ -65,8 +65,8 @@ select
     date_sub(date '{{ window_end }}', interval 6 day) as window_start,
     date '{{ window_end }}' as window_end
     {%- else %}
-    cast(null as date) as window_start,
-    cast(null as date) as window_end
+        cast(null as date) as window_start,
+        cast(null as date) as window_end
     {%- endif %}
 from top_repos
 inner join {{ ref('dim_repo') }} as dim_repo

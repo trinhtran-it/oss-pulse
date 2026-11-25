@@ -259,6 +259,9 @@ unit_tests:
     overrides:
       macros:
         is_incremental: false # test the first-build path; the flag logic is the same in both
+      vars: # fixed window around the input rows, whatever --vars the build uses (e.g. CI's 2 days)
+        history_start_date: "2026-10-01"
+        run_date: "2026-10-01"
     given:
       - input: ref('int_events_enriched')
         rows:

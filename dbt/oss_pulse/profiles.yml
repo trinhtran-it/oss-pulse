@@ -34,8 +34,9 @@ oss_pulse:
       type: bigquery
       method: oauth
       project: "{{ env_var('GCP_PROJECT_ID') }}"
-      dataset: oss_pulse_ci
+      dataset: oss_pulse_ci # Terraform-managed; tables expire after 1 day
       location: "{{ env_var('GCP_REGION', 'asia-southeast1') }}"
       threads: 4
       job_execution_timeout_seconds: 600
-      maximum_bytes_billed: 10000000000
+      job_retries: 1
+      maximum_bytes_billed: 2000000000 # 2 GB: CI builds 2 days (~0.5 GB per model); more = a bug

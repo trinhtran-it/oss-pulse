@@ -22,3 +22,14 @@ output "dataproc_subnet" {
   description = "Subnet name for `gcloud dataproc batches submit --subnet`."
   value       = google_compute_subnetwork.pipeline.name
 }
+
+# Set these as GitHub repository variables (Settings -> Secrets and variables -> Actions -> Variables).
+output "ci_workload_identity_provider" {
+  description = "GitHub variable GCP_WIF_PROVIDER (google-github-actions/auth workload_identity_provider)."
+  value       = local.ci_enabled ? google_iam_workload_identity_pool_provider.github[0].name : null
+}
+
+output "ci_service_account_email" {
+  description = "GitHub variable GCP_CI_SERVICE_ACCOUNT."
+  value       = local.ci_enabled ? google_service_account.ci[0].email : null
+}

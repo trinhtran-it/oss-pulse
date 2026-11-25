@@ -12,9 +12,13 @@
 
 with window_events as (
 
-    select actor_id, actor_login, created_at
+    select
+        actor_id,
+        actor_login,
+        created_at
     from {{ ref('int_events_enriched') }}
-    where {{ event_window('created_at') }}
+    where
+        {{ event_window('created_at') }}
         and actor_id is not null
 
 ),
@@ -33,16 +37,16 @@ actors_in_window as (
 
 combined as (
 
-{% if is_incremental() %}
-    select
-        w.actor_id,
-        if(existing.last_seen_at > w.last_seen_at, existing.actor_login, w.latest_login) as actor_login,
-        least(w.first_seen_at, coalesce(existing.first_seen_at, w.first_seen_at)) as first_seen_at,
-        greatest(w.last_seen_at, coalesce(existing.last_seen_at, w.last_seen_at)) as last_seen_at
-    from actors_in_window as w
-    left join {{ this }} as existing
-        on existing.actor_id = w.actor_id
-{% else %}
+    {% if is_incremental() %}
+        select
+            w.actor_id,
+            if(existing.last_seen_at > w.last_seen_at, existing.actor_login, w.latest_login) as actor_login,
+            least(w.first_seen_at, coalesce(existing.first_seen_at, w.first_seen_at)) as first_seen_at,
+            greatest(w.last_seen_at, coalesce(existing.last_seen_at, w.last_seen_at)) as last_seen_at
+        from actors_in_window as w
+        left join {{ this }} as existing
+            on w.actor_id = existing.actor_id
+    {% else %}
     select actor_id, latest_login as actor_login, first_seen_at, last_seen_at
     from actors_in_window
 {% endif %}

@@ -75,3 +75,26 @@ variable "dataproc_subnet_cidr" {
     error_message = "dataproc_subnet_cidr must be a valid CIDR block, e.g. 10.10.0.0/24."
   }
 }
+
+variable "github_repository" {
+  description = "GitHub repo allowed to run CI against this project, as owner/name. Empty = no CI resources."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.github_repository == "" || can(regex("^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$", var.github_repository))
+    error_message = "github_repository must look like owner/name, e.g. octocat/oss-pulse."
+  }
+}
+
+variable "bq_dataset_ci" {
+  description = "Dataset for dbt CI builds (tables expire after 1 day)."
+  type        = string
+  default     = "oss_pulse_ci"
+}
+
+variable "wif_pool_id" {
+  description = "Workload Identity pool ID. Deleted pool IDs stay reserved for 30 days."
+  type        = string
+  default     = "oss-pulse-github"
+}

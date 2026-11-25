@@ -1,8 +1,12 @@
 {#
   WHERE-clause predicate selecting the days an incremental model should (re)build.
 
-    Incremental run with run_date set:  [run_date - lookback_days, run_date]
-    Anything else (first build, --full-refresh, no run_date):  everything since history_start_date
+    Incremental run with run_date set:            [run_date - lookback_days, run_date]
+    First build / --full-refresh with run_date:   [history_start_date, run_date]
+    No run_date:                                  everything since history_start_date
+
+  CI uses the middle case to build a small window, e.g.
+    --vars '{history_start_date: 2026-10-30, run_date: 2026-10-31}'
 
   Bounds are constant expressions, so BigQuery prunes partitions (and raw.events'
   require_partition_filter is satisfied). Never derive bounds from a subquery such as
@@ -17,7 +21,7 @@
         {%- set end_date = "date '" ~ run_date ~ "'" -%}
     {%- else -%}
         {%- set start_date = "date '" ~ var('history_start_date') ~ "'" -%}
-        {%- set end_date = none -%}
+        {%- set end_date = ("date '" ~ run_date ~ "'") if run_date else none -%}
     {%- endif -%}
 
     {%- if column_type == 'timestamp' -%}
@@ -45,12 +49,13 @@
     {%- set run_date = var('run_date', none) -%}
     {%- if not run_date -%}
         {{ return(none) }}
+    {%- else -%}
+        {%- set end = modules.datetime.date.fromisoformat(run_date | string) -%}
+        {%- set ns = namespace(days=[]) -%}
+        {%- for offset in range(var('lookback_days') | int, -1, -1) -%}
+            {%- set day = end - modules.datetime.timedelta(days=offset) -%}
+            {%- set ns.days = ns.days + ["date '" ~ day.isoformat() ~ "'"] -%}
+        {%- endfor -%}
+        {{ return(ns.days) }}
     {%- endif -%}
-    {%- set end = modules.datetime.date.fromisoformat(run_date | string) -%}
-    {%- set ns = namespace(days=[]) -%}
-    {%- for offset in range(var('lookback_days') | int, -1, -1) -%}
-        {%- set day = end - modules.datetime.timedelta(days=offset) -%}
-        {%- set ns.days = ns.days + ["date '" ~ day.isoformat() ~ "'"] -%}
-    {%- endfor -%}
-    {{ return(ns.days) }}
 {%- endmacro %}

@@ -11,9 +11,14 @@
 
 with window_events as (
 
-    select repo_id, repo_name, repo_owner, created_at
+    select
+        repo_id,
+        repo_name,
+        repo_owner,
+        created_at
     from {{ ref('int_events_enriched') }}
-    where {{ event_window('created_at') }}
+    where
+        {{ event_window('created_at') }}
         and repo_id is not null  -- rare upstream quirk: "repo": {}
 
 ),
@@ -33,17 +38,17 @@ repos_in_window as (
 
 combined as (
 
-{% if is_incremental() %}
-    select
-        w.repo_id,
-        if(existing.last_seen_at > w.last_seen_at, existing.repo_name, w.latest.repo_name) as repo_name,
-        if(existing.last_seen_at > w.last_seen_at, existing.repo_owner, w.latest.repo_owner) as repo_owner,
-        least(w.first_seen_at, coalesce(existing.first_seen_at, w.first_seen_at)) as first_seen_at,
-        greatest(w.last_seen_at, coalesce(existing.last_seen_at, w.last_seen_at)) as last_seen_at
-    from repos_in_window as w
-    left join {{ this }} as existing
-        on existing.repo_id = w.repo_id
-{% else %}
+    {% if is_incremental() %}
+        select
+            w.repo_id,
+            if(existing.last_seen_at > w.last_seen_at, existing.repo_name, w.latest.repo_name) as repo_name,
+            if(existing.last_seen_at > w.last_seen_at, existing.repo_owner, w.latest.repo_owner) as repo_owner,
+            least(w.first_seen_at, coalesce(existing.first_seen_at, w.first_seen_at)) as first_seen_at,
+            greatest(w.last_seen_at, coalesce(existing.last_seen_at, w.last_seen_at)) as last_seen_at
+        from repos_in_window as w
+        left join {{ this }} as existing
+            on w.repo_id = existing.repo_id
+    {% else %}
     select
         repo_id,
         latest.repo_name as repo_name,

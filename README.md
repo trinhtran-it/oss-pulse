@@ -46,7 +46,7 @@ Looker Studio reads two small mart tables. The diagram source is [docs/diagrams/
 | Transformation | **dbt** | Tests that gate downstream models, incremental partition replacement, lineage and docs | Scheduled SQL: no tests or lineage |
 | Orchestration | **Airflow 3** (Docker Compose) | Data-interval scheduling, catchup/backfill, retries, deferrable Dataproc operator, failure callbacks | Cloud Composer: managed, but several hundred dollars a month even when idle; Dagster: also good, less common in job ads |
 | Dashboard | **Looker Studio** | Free, native BigQuery connector, shareable link | Metabase/Superset: needs hosting |
-| CI | **GitHub Actions** | ruff, pytest, image builds, dbt parse, DAG import check on every push | — |
+| CI/CD | **GitHub Actions** + Workload Identity Federation | Every PR: lint (Python, SQL, Terraform), tests, secret scan, DAG import, and a real dbt build on BigQuery, with no stored GCP key | JSON key in GitHub Secrets: long-lived, can leak |
 
 ## Data model
 
@@ -229,6 +229,40 @@ Checks at every layer. A failure stops the run before bad data reaches the next 
 
 It reads only `agg_events_hourly` (1 MB) and `rpt_top_repos_7d` (10 rows), never `raw` and never the big marts. Each chart refresh is a billed query: on `fct_events` the same tiles would scan ~1 GB, and here each stays at the 10 MB minimum. Build spec: [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
+## CI/CD
+
+Every pull request runs [.github/workflows/ci.yml](.github/workflows/ci.yml). `main` is protected: a PR can only merge when all checks pass, and all work goes through feature branches.
+
+| Check (job) | What it catches | Credentials |
+|---|---|---|
+| `python (ruff + pytest)` | Lint, formatting, 88 unit tests (ingestion, Spark on a local JVM, alerts); builds the ingestion image | none |
+| `sql lint (sqlfluff)` | Style and ambiguity in dbt SQL, as inline PR annotations | none |
+| `terraform (fmt + validate)` | Unformatted or invalid Terraform | none |
+| `secret scan (gitleaks)` | Keys and tokens anywhere in the git history (pinned release, checksum verified) | none |
+| `airflow (DAG import)` | DAG import errors inside the real Airflow image | none |
+| `dbt (build on BigQuery)` | SQL that compiles but fails or breaks a test on real data. Runs a 2-day **full build** of every model and test in `oss_pulse_ci`, then the **daily incremental path** on top of it | Workload Identity Federation |
+
+**No GCP key in GitHub.** The dbt job asks GitHub for a short-lived OIDC token, and [google-github-actions/auth](https://github.com/google-github-actions/auth) exchanges it for a ~1-hour credential of the `oss-pulse-ci` service account ([terraform/ci.tf](terraform/ci.tf)):
+- The identity pool only accepts tokens whose `repository` is this repo. Pull requests from forks get no token, and the dbt build is skipped for them.
+- The service account can run BigQuery jobs, read `oss_pulse_raw` and write `oss_pulse_ci`. Nothing else: no access to the marts, the bucket or Dataproc.
+- `oss_pulse_ci` tables expire after a day. Runs share the dataset, so they're serialized (`concurrency`), and each starts with `--full-refresh`, so results never depend on a previous run.
+- Each CI run bills ~0.9 GiB of BigQuery (126 queries, mostly the 10 MB minimum each), so the free tier covers ~1,100 runs a month. A 2 GB per-query cap in the `ci` profile fails the build if the window ever breaks.
+
+**Run the same checks locally:**
+```bash
+make ci-local      # ruff, sqlfluff, pytest, terraform fmt/validate, gitleaks (no cloud access)
+make dbt-ci        # the two CI dbt builds, with your own credentials
+```
+
+**Set it up on your fork** (once, after `make infra-up` with `GITHUB_REPOSITORY=<owner>/<repo>` in `.env`):
+```bash
+gh variable set GCP_PROJECT_ID         --body "<your-project-id>"
+gh variable set GCP_REGION             --body "<your-region>"
+gh variable set GCP_WIF_PROVIDER       --body "$(terraform -chdir=terraform output -raw ci_workload_identity_provider)"
+gh variable set GCP_CI_SERVICE_ACCOUNT --body "$(terraform -chdir=terraform output -raw ci_service_account_email)"
+```
+Then, in **Settings → Branches**, protect `main`: require a pull request, and require the six checks above to pass. These are repository *variables*, not secrets. None of them grants access on its own; access comes from the identity pool's repository condition.
+
 ## How to run
 
 ### Prerequisites
@@ -324,7 +358,8 @@ What this project actually used from 2026-11-01 to 11-19. That covers every deve
 | **One month of data** | Weekday patterns aren't reliable (4–5 samples each); push metrics are incomplete for Oct 2026 | Backfill several months, and show source eras on the dashboard | Dataproc ~$1 per month of data |
 | **Spark is more than today's volume needs** | ~100k events/day now; Spark was sized for 2025 volumes (3.5M/day) | Load raw JSON straight into BigQuery and flatten in dbt; keep Spark for large backfills | ~1 day |
 | **"Marts only" for the dashboard is a convention** | The dashboard credential (my account) could read `raw` | Service account with `dataViewer` on `oss_pulse_marts` only | ~30 min of Terraform, free |
-| **CI doesn't run dbt against BigQuery** | SQL errors show up only on a real build | `dbt build --empty --target ci` with Workload Identity Federation | ~2 h, ~free |
+| **CI builds a fixed 2-day window** (Oct 30–31) | A bug that only shows on other days' data passes CI | Pick the latest loaded days via `INFORMATION_SCHEMA.PARTITIONS`, or add a weekly wider build | ~1 h, ~free |
+| **No CD for infrastructure or the Spark job** | `terraform apply` and `make spark-upload` are run by hand after merging | A `main`-only job: `terraform plan` on PRs, `apply` + `spark-upload` after merge, with its own narrowly-scoped service account | ~half a day, free |
 | **Spark runs one day at a time** | A month's backfill takes hours | Raise the `CPUS_ALL_REGIONS` quota to 24+ | free (quota request) |
 
 ## Repository layout
@@ -337,5 +372,5 @@ warehouse/            raw.events and load_log DDL, load script, cost benchmark
 dbt/oss_pulse/        staging → intermediate → marts, seeds, macros, tests
 airflow/              DAG, alert callback, Compose file, image, chaos test
 docs/                 DATA_NOTES, DEVLOG, DASHBOARD, diagrams and screenshots
-.github/workflows/    CI: lint, tests, image builds, dbt parse, DAG import
+.github/              CI workflow, Dependabot, PR template
 ```

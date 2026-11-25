@@ -27,7 +27,8 @@ select
     count(distinct actor_id) as unique_actors,
     count(*) as events
 from {{ ref('fct_events') }}
-where {{ event_window('event_date', 'date') }}
+where
+    {{ event_window('event_date', 'date') }}
     and not is_bot
     and repo_id is not null
 group by event_date, repo_id

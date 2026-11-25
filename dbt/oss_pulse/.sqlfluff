@@ -1,0 +1,20 @@
+# SQL lint for the dbt project: `make sql-lint` (also in CI).
+# Jinja templater on purpose: renders models without a BigQuery connection (the dbt templater
+# would compile the project and run rpt_top_repos_7d's run_query against BigQuery).
+[sqlfluff]
+dialect = bigquery
+templater = jinja
+max_line_length = 120
+# ST06 (wildcards/simple columns before calculations) is off: marts list columns by meaning
+# (keys, attributes, flags), and reordering would change table schemas.
+exclude_rules = ST06
+
+[sqlfluff:templater:jinja]
+apply_dbt_builtins = True
+load_macros_from_path = macros
+library_path = sqlfluff_libs
+
+
+[sqlfluff:rules:references.keywords]
+# dim_date.year / quarter / month are part of the mart's public columns.
+ignore_words = year, quarter, month

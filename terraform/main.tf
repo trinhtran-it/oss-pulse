@@ -45,6 +45,8 @@ resource "google_project_service" "apis" {
     "compute.googleapis.com", # VPC for Dataproc Serverless
     "dataproc.googleapis.com",
     "iam.googleapis.com",
+    "iamcredentials.googleapis.com", # CI: short-lived tokens for the CI service account
+    "sts.googleapis.com",            # CI: exchanges GitHub OIDC tokens (Workload Identity Federation)
     "storage.googleapis.com",
   ])
 

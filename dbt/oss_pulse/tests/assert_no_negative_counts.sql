@@ -3,7 +3,8 @@
 
 select *
 from {{ ref('agg_repo_daily') }}
-where stars < 0
+where
+    stars < 0
     or forks < 0
     or pushes < 0
     or prs_opened < 0

@@ -18,11 +18,12 @@ END   ?= $(START)
 export TF_VAR_project_id  := $(GCP_PROJECT_ID)
 export TF_VAR_region      := $(GCP_REGION)
 export TF_VAR_bucket_name := $(GCS_BUCKET)
+export TF_VAR_github_repository := $(GITHUB_REPOSITORY)
 TF_STATE_PREFIX ?= oss-pulse/dev
 TF_BACKEND = $(if $(wildcard terraform/backend.hcl),-backend-config=backend.hcl,\
 	-backend-config=bucket=$(TF_STATE_BUCKET) -backend-config=prefix=$(TF_STATE_PREFIX))
 
-.PHONY: help check-env setup test lint \
+.PHONY: help check-env setup test lint sql-lint tf-check secrets-scan ci-local dbt-ci \
 	infra-up infra-down tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output \
 	up down airflow-build airflow-check airflow-unpause airflow-trigger backfill chaos-test \
 	ingest ingest-image ingest-docker spark-upload spark-local spark-dataproc \
@@ -50,9 +51,23 @@ setup: ## Create .venv with all Python deps and install dbt packages
 test: ## Unit tests: ingestion, Spark (needs Java 17) and Airflow alerts; no cloud access
 	.venv/bin/pytest
 
-lint: ## ruff check + format check
+lint: sql-lint ## ruff (Python) + sqlfluff (dbt SQL)
 	.venv/bin/ruff check .
 	.venv/bin/ruff format --check .
+
+sql-lint: ## sqlfluff on dbt models and tests (Jinja templater, no BigQuery needed)
+	cd dbt/oss_pulse && ../../.venv/bin/sqlfluff lint models tests
+
+tf-check: ## terraform fmt -check + validate (no credentials needed)
+	terraform -chdir=terraform fmt -check -recursive
+	terraform -chdir=terraform init -backend=false -input=false >/dev/null
+	terraform -chdir=terraform validate
+
+GITLEAKS_IMAGE := ghcr.io/gitleaks/gitleaks:v8.30.1
+secrets-scan: ## gitleaks over the full git history (Docker)
+	docker run --rm -v "$$PWD:/repo:ro" $(GITLEAKS_IMAGE) git /repo --redact --no-banner
+
+ci-local: lint test tf-check secrets-scan ## Every CI check that needs no cloud access
 
 diagrams: ## Render docs/*.png from docs/diagrams/*.dot (needs Graphviz)
 	dot -Tpng -Gdpi=150 docs/diagrams/architecture.dot -o docs/architecture.png
@@ -222,6 +237,14 @@ dbt-test:
 
 dbt-freshness: ## Source freshness of raw.events (warn 26 h, error 50 h)
 	$(DBT) source freshness $(DBT_FLAGS)
+
+# What CI runs against BigQuery: a 2-day full build, then the daily incremental path on top.
+CI_VARS := {history_start_date: 2026-10-30, run_date: 2026-10-31}
+dbt-ci: ## The CI dbt builds, in the oss_pulse_ci dataset (needs the CI Terraform resources)
+	$(DBT) build --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci \
+		--full-refresh --vars '$(CI_VARS)'
+	$(DBT) build --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci \
+		--vars '$(CI_VARS)'
 
 dbt-docs: ## dbt docs as one static HTML file (target/static_index.html)
 	$(DBT) docs generate $(DBT_FLAGS) --static

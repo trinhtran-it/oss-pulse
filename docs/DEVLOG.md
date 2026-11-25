@@ -2,6 +2,13 @@
 
 Short entries on things that broke, surprised me, or changed a decision. Newest first.
 
+## 2026-11-19: Two things CI caught before it even ran in GitHub
+
+1. **`sqlfluff fix` reordered columns.** I had put `exclude_rules` under `[sqlfluff:rules]`, where sqlfluff silently ignores it. So rule ST06 moved every computed column to the end of `stg_events`, `dim_repo` and `agg_events_hourly`. The SQL was still valid, but the incremental tables would no longer match their existing schemas, and the partition copy jobs need an exact match. I reverted, moved the setting to `[sqlfluff]`, and re-ran: the remaining fixes were layout only. Lesson: read an auto-fixer's diff like a colleague's PR.
+2. **The `is_bot` unit test depended on CLI vars.** CI builds a 2-day window (`history_start_date: 2026-10-30`), and the unit test's input rows are dated 10-01, so the window filtered them out and the test failed. A unit test should pin its own context, so it now sets its `vars` in `overrides`.
+
+CI's BigQuery build costs ~0.9 GiB per run (126 queries, mostly at the 10 MB minimum) and authenticates through Workload Identity Federation, so no service-account key exists.
+
 ## 2026-11-19: The dashboard was right, the first drafts were misleading
 
 The Looker Studio report reads two tables built for it (`agg_events_hourly`, 1 MB, and `rpt_top_repos_7d`, 10 rows) instead of `fct_events` (2.4 GB). Each chart refresh is a billed query, and on `fct_events` the same tiles would scan ~1 GB per refresh.
