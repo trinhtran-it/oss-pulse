@@ -38,4 +38,10 @@ def _date_spine(datepart, start_date, end_date):
     return f"select cast({start_date} as datetime) as date_day"
 
 
-dbt_utils = _types.SimpleNamespace(date_spine=_date_spine)
+def _generate_surrogate_key(field_list):
+    return "to_hex(md5(" + " || '-' || ".join(f"cast({f} as string)" for f in field_list) + "))"
+
+
+dbt_utils = _types.SimpleNamespace(
+    date_spine=_date_spine, generate_surrogate_key=_generate_surrogate_key
+)
