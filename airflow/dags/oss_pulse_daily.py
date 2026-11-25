@@ -70,12 +70,16 @@ DBT_FLAGS = (
     f'--target-path "{DBT_ARTIFACTS}/target" --log-path "{DBT_ARTIFACTS}/logs"'
 )
 
+# Slim CI compares pull requests with this manifest (dbt/scripts/prod_manifest.py).
+DBT_PROD_MANIFEST_OBJECT = os.environ.get("DBT_PROD_MANIFEST_OBJECT", "dbt/prod/manifest.json")
+
 PIPELINE_TASKS = [
     "ingest_raw",
     "spark_flatten",
     "load_bq_partition",
     "dbt_source_freshness",
     "dbt_build",
+    "publish_dbt_manifest",
 ]
 
 
@@ -235,6 +239,24 @@ with DAG(
         execution_timeout=timedelta(minutes=45),
     )
 
+    # Slim CI's "state": the manifest of the code that just built prod. Uploaded only after a
+    # successful build, so CI never compares against code that failed in prod.
+    @task(retries=2, execution_timeout=timedelta(minutes=5))
+    def publish_dbt_manifest(ds: str | None = None) -> str:
+        """Upload this run's dbt manifest.json to gs://<bucket>/dbt/prod/manifest.json."""
+        manifest = f"/opt/airflow/logs/dbt/{ds}/dbt_build/target/manifest.json"
+        if not os.path.isfile(manifest):
+            raise AirflowException(f"{manifest} not found: did dbt_build write its artifacts?")
+        GCSHook().upload(
+            bucket_name=BUCKET,
+            object_name=DBT_PROD_MANIFEST_OBJECT,
+            filename=manifest,
+            mime_type="application/json",
+        )
+        uri = f"gs://{BUCKET}/{DBT_PROD_MANIFEST_OBJECT}"
+        log.info("Published %s as %s", manifest, uri)
+        return uri
+
     @task(
         trigger_rule=TriggerRule.ALL_DONE,  # also runs when an upstream task failed
         retries=1,
@@ -282,6 +304,7 @@ with DAG(
         return status
 
     loaded = load_bq_partition()
+    manifest = publish_dbt_manifest()
     audit = record_audit()
 
-    ingest_raw >> spark_flatten >> loaded >> dbt_source_freshness >> dbt_build >> audit
+    ingest_raw >> spark_flatten >> loaded >> dbt_source_freshness >> dbt_build >> manifest >> audit

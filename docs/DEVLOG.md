@@ -2,6 +2,16 @@
 
 Short entries on things that broke, surprised me, or changed a decision. Newest first.
 
+## 2026-11-25: Slim CI, and the flag that makes `--defer` trustworthy
+
+A pull request's CI now builds only what changed: `dbt build --select state:modified+ --defer --state <prod manifest>`. Airflow publishes the prod manifest after every successful build. Three things I only learned by testing:
+
+1. **`--defer` alone can read the wrong table.** It falls back to prod only when a parent is *missing* from the CI dataset. Earlier CI runs leave tables in `oss_pulse_ci` for up to a day, so `agg_repo_daily` was built on `oss_pulse_ci.fct_events`. On GitHub that could be another branch's version. `--favor-state` makes dbt read unchanged parents from prod every time. I checked the compiled SQL: `oss_pulse_marts.fct_events` and `oss_pulse_marts.dim_repo`.
+2. **Vars rendered in configs count as changes.** With no code change, 4 tests were still "modified", because their `where:` filter renders `var('history_start_date')`, and CI overrides that var to keep the window at 2 days. Vars used *inside macros* are not compared, which is why the models weren't flagged. I kept the 4 tests: they take seconds and are bounded to 2 days.
+3. **`--state` is resolved from the dbt project directory,** not from where `make` runs. A relative path gave "no comparison manifest", so the path is absolute now.
+
+Result: editing one aggregate builds 14 nodes instead of 56 (65 s instead of 123 s), and comparing prod with CI shows 0 modified nodes when nothing changed.
+
 ## 2026-11-19: Two things CI caught before it even ran in GitHub
 
 1. **`sqlfluff fix` reordered columns.** I had put `exclude_rules` under `[sqlfluff:rules]`, where sqlfluff silently ignores it. So rule ST06 moved every computed column to the end of `stg_events`, `dim_repo` and `agg_events_hourly`. The SQL was still valid, but the incremental tables would no longer match their existing schemas, and the partition copy jobs need an exact match. I reverted, moved the setting to `[sqlfluff]`, and re-ran: the remaining fixes were layout only. Lesson: read an auto-fixer's diff like a colleague's PR.

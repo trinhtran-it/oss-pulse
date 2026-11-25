@@ -23,7 +23,7 @@ TF_STATE_PREFIX ?= oss-pulse/dev
 TF_BACKEND = $(if $(wildcard terraform/backend.hcl),-backend-config=backend.hcl,\
 	-backend-config=bucket=$(TF_STATE_BUCKET) -backend-config=prefix=$(TF_STATE_PREFIX))
 
-.PHONY: help check-env setup test lint sql-lint tf-check secrets-scan ci-local dbt-ci \
+.PHONY: help check-env setup test lint sql-lint tf-check secrets-scan ci-local dbt-ci dbt-ci-slim dbt-publish-manifest \
 	infra-up infra-down tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output \
 	up down airflow-build airflow-check airflow-unpause airflow-trigger backfill chaos-test \
 	ingest ingest-image ingest-docker spark-upload spark-local spark-dataproc \
@@ -245,6 +245,29 @@ dbt-ci: ## The CI dbt builds, in the oss_pulse_ci dataset (needs the CI Terrafor
 		--full-refresh --vars '$(CI_VARS)'
 	$(DBT) build --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci \
 		--vars '$(CI_VARS)'
+
+# Slim CI: build only what changed vs. prod (state:modified+), read everything else from prod
+# (--defer). Falls back to the full dbt-ci build when no prod manifest has been published yet.
+PROD_STATE := dbt/oss_pulse/target/prod-state
+# --favor-state: always read unchanged parents from prod, even if an older CI run left a copy in
+# oss_pulse_ci (it could be another branch's version). --state must be absolute.
+SLIM := --select state:modified+ --defer --favor-state --state $(CURDIR)/$(PROD_STATE)
+dbt-ci-slim: ## CI dbt builds, only for models changed vs. prod (falls back to dbt-ci)
+	@rc=0; $(PY) dbt/scripts/prod_manifest.py download $(PROD_STATE) || rc=$$?; \
+	if [ $$rc -eq 3 ]; then echo "No prod manifest yet: full CI build"; $(MAKE) --no-print-directory dbt-ci; \
+	elif [ $$rc -ne 0 ]; then exit $$rc; \
+	else \
+		$(DBT) build --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci \
+			--full-refresh --vars '$(CI_VARS)' $(SLIM) && \
+		$(DBT) build --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target ci \
+			--vars '$(CI_VARS)' $(SLIM); \
+	fi
+
+# Airflow publishes the manifest after every prod build (publish_dbt_manifest). Use this once,
+# before the first Airflow run, or to reset Slim CI's baseline to the current code.
+dbt-publish-manifest: ## Upload the prod dbt manifest (Slim CI's baseline) from this checkout
+	$(DBT) parse --project-dir dbt/oss_pulse --profiles-dir dbt/oss_pulse --target prod --target-path target/prod-publish
+	$(PY) dbt/scripts/prod_manifest.py upload dbt/oss_pulse/target/prod-publish/manifest.json
 
 dbt-docs: ## dbt docs as one static HTML file (target/static_index.html)
 	$(DBT) docs generate $(DBT_FLAGS) --static
