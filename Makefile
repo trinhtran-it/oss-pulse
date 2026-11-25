@@ -27,7 +27,7 @@ TF_BACKEND = $(if $(wildcard terraform/backend.hcl),-backend-config=backend.hcl,
 	infra-up infra-down tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output \
 	up down airflow-build airflow-check airflow-unpause airflow-trigger backfill chaos-test \
 	ingest ingest-image ingest-docker spark-upload spark-local spark-dataproc \
-	bq-table bq-audit-table bq-load bq-cost-demo bq-cost-chart \
+	bq-table bq-audit-table bq-load bq-cost-demo bq-cost-chart metrics \
 	dbt-deps dbt-debug dbt-build dbt-test dbt-freshness dbt-docs diagrams
 
 help: ## Show this list
@@ -211,6 +211,9 @@ bq-cost-demo:
 
 bq-cost-chart:
 	$(PY) warehouse/plot_cost.py
+
+metrics: ## README "At a glance" numbers from real data: [START=YYYY-MM-DD END=YYYY-MM-DD]
+	warehouse/metrics.sh $(if $(filter command line,$(origin START)),$(START) $(END))
 
 ## dbt
 # make dbt-build                                      # dev target (DBT_DEV_DATASET), all history

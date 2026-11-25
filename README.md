@@ -6,6 +6,21 @@ A daily batch pipeline that turns [GH Archive](https://www.gharchive.org/) (ever
 
 ![dashboard](docs/dashboard.png)
 
+## At a glance
+
+Measured on the October 2026 backfill (2026-11-25). `make metrics` recomputes the data numbers from BigQuery, GCS and Airflow.
+
+| | Value | Proof |
+|---|---|---|
+| Events loaded | **30,008,428** over **31/31 days**, raw = `fct_events` | [backfill results](#orchestration-airflow-3), `audit.load_log` |
+| Events per day | **~1.0M** average (81k–2.07M; the low days are a [source gap](docs/DATA_NOTES.md#volume)) | `raw.events` |
+| Raw data | **243 MiB/day** gzip on average, 529 MiB peak, 7.4 GiB for the month | GCS `raw/` |
+| End-to-end runtime | **8 min** median per day (ingest → Spark → load → dbt → audit) | Airflow metadata, 31 runs |
+| Partitioning + clustering | **−99.7%** bytes for the same query (290.7 MB → 0.9 MB) | [benchmark](#warehouse-bigquery-and-the-partitioning-decision) |
+| Tests | **45** dbt tests (incl. a unit test) + **88** Python tests; 6 CI jobs on every PR | [data quality](#data-quality), [CI/CD](#cicd) |
+| Slim CI | Editing one model builds **14 of 56** nodes (65 s instead of 123 s) | [CI/CD](#cicd) |
+| Cloud cost | **≈ $2** for the month (BigQuery within the free tier) | [cost](#cost) |
+
 ## Problem
 
 GitHub shows the activity of one repository at a time. It does not answer cross-repository questions such as "which projects are gaining attention this week?" or "how much of GitHub's activity is automated?". GH Archive has the raw data, millions of events a day as nested JSON, but nobody can query that directly. Teams that track open source (OSS program offices, developer relations, engineers choosing a dependency) need it cleaned, modeled and refreshed every day, with numbers they can trust.
