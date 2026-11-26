@@ -1,0 +1,17 @@
+# Read-only Postgres connection (role "grafana", SELECT on the sink table and view only).
+apiVersion: 1
+datasources:
+  - name: streaming-postgres
+    uid: streaming-pg
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: grafana
+    isDefault: true
+    jsonData:
+      database: streaming
+      sslmode: disable
+      postgresVersion: 1700
+      timescaledb: false
+    secureJsonData:
+      password: grafana

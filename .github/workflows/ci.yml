@@ -41,6 +41,13 @@ jobs:
       - run: pytest
       - name: build ingestion image
         run: docker build -f ingestion/Dockerfile -t oss-pulse-ingestion .
+      # Streaming stack: compose file valid, producer image builds, Flink image builds (its
+      # Dockerfile verifies every connector jar against Maven Central's SHA-1).
+      - name: build streaming images
+        run: |
+          docker compose -f streaming/docker-compose.yaml config --quiet
+          docker build -f streaming/producer/Dockerfile -t oss-pulse-wiki-producer:ci .
+          docker build -f streaming/flink/Dockerfile -t oss-pulse-flink:ci .
 
   sql-lint:
     name: sql lint (sqlfluff)
