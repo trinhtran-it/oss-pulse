@@ -23,7 +23,7 @@ TF_STATE_PREFIX ?= oss-pulse/dev
 TF_BACKEND = $(if $(wildcard terraform/backend.hcl),-backend-config=backend.hcl,\
 	-backend-config=bucket=$(TF_STATE_BUCKET) -backend-config=prefix=$(TF_STATE_PREFIX))
 
-.PHONY: help check-env setup test lint sql-lint tf-check secrets-scan ci-local dbt-ci dbt-ci-slim dbt-publish-manifest \
+.PHONY: help check-env setup test lint stream-up stream-down stream-status stream-check stream-logs sql-lint tf-check secrets-scan ci-local dbt-ci dbt-ci-slim dbt-publish-manifest \
 	infra-up infra-down tf-bootstrap tf-init tf-plan tf-apply tf-destroy tf-output \
 	up down airflow-build airflow-check airflow-unpause airflow-trigger backfill chaos-test \
 	ingest ingest-image ingest-docker spark-upload spark-local spark-dataproc \
@@ -72,6 +72,7 @@ ci-local: lint test tf-check secrets-scan ## Every CI check that needs no cloud 
 diagrams: ## Render docs/*.png from docs/diagrams/*.dot (needs Graphviz)
 	dot -Tpng -Gdpi=150 docs/diagrams/architecture.dot -o docs/architecture.png
 	dot -Tpng -Gdpi=150 docs/diagrams/data_model.dot -o docs/data_model.png
+	dot -Tpng -Gdpi=150 docs/diagrams/streaming.dot -o docs/streaming.png
 
 ## Cloud infrastructure (Terraform + BigQuery tables + Spark job)
 infra-up: check-env tf-bootstrap tf-init ## Create or update everything in GCP (asks before applying)
@@ -142,6 +143,31 @@ backfill: ## (Re)run days START=YYYY-MM-DD END=YYYY-MM-DD (DAG must be unpaused)
 
 chaos-test: ## Clear a finished day, re-run it, compare counts: DAY=YYYY-MM-DD
 	airflow/chaos_rerun.sh $(DAY)
+
+## Streaming (stretch goal: Wikimedia -> Redpanda -> Flink -> Postgres -> Grafana)
+# Grafana http://localhost:3000 · Flink UI http://localhost:8082 · Redpanda Console http://localhost:8083
+STREAM := docker compose -f streaming/docker-compose.yaml --env-file .env
+WINDOWS ?= 6
+
+FRESH ?= 0
+stream-up: ## Start the stack + Flink job (resumes its checkpoint; FRESH=1 after changing the SQL)
+	$(STREAM) up -d --build --wait --wait-timeout 300 redpanda postgres jobmanager taskmanager grafana console producer
+	$(STREAM) run --rm -e FRESH_START=$(FRESH) job-submit
+
+stream-down: ## Stop the streaming stack (keeps topic, checkpoints and Postgres)
+	$(STREAM) down
+
+stream-status: ## Containers, Flink job state and the newest windows
+	@$(STREAM) ps --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
+	@curl -fsS http://localhost:8082/jobs/overview | $(PY) streaming/flink_jobs.py
+	@$(STREAM) exec -T postgres psql -U $${STREAM_PG_USER:-flink} -d streaming -c \
+		"select window_start, edits, bot_edits, wikis, round(extract(epoch from first_written_at - window_end)) as latency_s from wiki_edits_5min_total order by window_start desc limit 5"
+
+stream-check: ## Reconcile the last WINDOWS closed windows: Postgres vs a recount from the topic
+	$(PY) streaming/check_windows.py --windows $(WINDOWS)
+
+stream-logs: ## Follow the producer's progress logs
+	$(STREAM) logs -f --tail 20 producer
 
 ## Pipeline steps one by one (what the DAG runs)
 # make ingest DATE=2026-10-01 [HOURS=0-23] [ARGS="--force"]

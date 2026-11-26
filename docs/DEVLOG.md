@@ -2,6 +2,36 @@
 
 Short entries on things that broke, surprised me, or changed a decision. Newest first.
 
+## 2026-11-26: Streaming: a 14-hour silent crash loop, and a watermark that dropped 42% of the data
+
+Wikimedia EventStreams → Redpanda → Flink SQL (5-minute windows) → Postgres → Grafana. It looked done after the first evening, and it wasn't.
+
+**1. "RUNNING" is not "working".** The submit script checked that the job was RUNNING, and it was, for a few seconds. Then every Kafka fetch failed with `NoClassDefFoundError: com/github/luben/zstd/BufferPool`: my producer compresses with zstd, and Flink's Kafka connector doesn't bundle the codec. The job crash-looped in `RESTARTING` for **14 hours** while every container showed "Up". Fixes:
+- add `zstd-jni` (the version kafka-clients 4.2.0 expects, checksum-verified) to the Flink image;
+- make the submit script wait for a **completed checkpoint**, which proves the source, the operators and the state all work;
+- add a "data age" panel in Grafana: orange after 10 minutes without a new window, red after 30.
+
+(Two smaller missing pieces on the way: the JDBC connector needs OpenLineage jars it doesn't ship, and `sql-client` exits 0 even when a statement fails.)
+
+**2. The watermark dropped 42% of the edits.** After the zstd fix, Flink re-read the topic: 158 windows, 650,935 edits, and 18 windows simply missing between 20:30 and 22:30 UTC. That's when the Mac slept. A recount from the topic showed the events *were* there: on waking, the producer had resumed with `Last-Event-ID` and replayed 4 hours of edits in 3 minutes. But **65% of the replayed events reached their partition more than a minute behind newer ones** (Wikimedia merges several upstream partitions during a replay), so a 1-minute watermark discarded them as late.
+- A bigger watermark would fix completeness by making the "live" tile hours stale.
+- The fix is **allowed lateness**: windows still fire 1 minute after they end, then fire again whenever late events arrive, for up to 6 hours. The upsert sink turns each re-fire into an UPDATE of the same row.
+- Catch: Flink 2.2's window table functions reject late firing ("doesn't support early-fire and late-fire"), so the job uses the legacy `GROUP BY TUMBLE`.
+
+After a fresh start (new consumer group, since a changed query can't restore old state): **184 windows, no gaps, 1,121,916 edits**. `make stream-check` matched all 60 windows of the last 5 hours **exactly**, including the replayed night.
+
+**3. Restarts.**
+- Killing the TaskManager: back in 48 s from checkpoint 4.
+- `make stream-down` for 2 minutes, then `stream-up`: Flink resumed from the retained checkpoint, and the producer replayed the outage at 189 events/s.
+- `COUNT(DISTINCT event_id)` is what makes these replays safe. A duplicate event has the same timestamp, so it lands in the same window and counts once.
+
+**Smaller lessons:**
+- `localhost` resolved to IPv6 `::1` while ports were published on `127.0.0.1`; Redpanda now advertises `127.0.0.1`.
+- A new Docker volume is owned by root while Flink runs as `flink`; a one-shot `checkpoint-init` service fixes ownership.
+- The image entrypoint, not my script, is what writes `FLINK_PROPERTIES` into the config.
+
+**Lesson.** In streaming, "it runs" proves nothing. Only reconciliation against the source showed both the crash loop's effect and the dropped late data, so the recount (`make stream-check`) is part of the project, not a one-off script.
+
 ## 2026-11-25: GitHub API enrichment: what the rate limits and ETags actually did
 
 Enrichment adds language and topics for the top 1,000 repos by stars (`GET /repositories/{id}`, by id because names change).

@@ -1,0 +1,29 @@
+// oss-pulse streaming stretch goal. Render: make diagrams  (-> docs/streaming.png)
+digraph streaming {
+  graph [rankdir=LR, fontname="Helvetica", fontsize=12, pad=0.3, nodesep=0.35, ranksep=0.45, bgcolor="white"]
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10,
+         fillcolor="#F4F6F8", color="#7B8794", penwidth=1, margin="0.14,0.07"]
+  edge  [fontname="Helvetica", fontsize=9, color="#52606D", fontcolor="#323F4B", arrowsize=0.7]
+
+  wiki [label=<<b>Wikimedia EventStreams</b><br/><font point-size="9">recentchange, SSE<br/>~37 events/s</font>>,
+        shape=cylinder, fillcolor="white"]
+  producer [label=<<b>wiki_producer.py</b><br/><font point-size="9">Last-Event-ID resume<br/>editor names hashed<br/>idempotent, acks=all</font>>]
+  topic [label=<<b>Redpanda</b><br/><font point-size="9">wiki.recentchange<br/>3 partitions, key = wiki, 24 h</font>>,
+         shape=cylinder, fillcolor="#FFF4E5", color="#B7791F"]
+  flink [label=<<b>Flink SQL</b><br/><font point-size="9">5-min tumbling window, event time<br/>watermark 1 min, COUNT(DISTINCT id)<br/>checkpoints every 30 s</font>>,
+         fillcolor="#E6F0FA", color="#3E6E9E"]
+  pg [label=<<b>Postgres</b><br/><font point-size="9">wiki_edits_5min<br/>upsert on (window_start, wiki)</font>>,
+      shape=cylinder, fillcolor="white"]
+  grafana [label=<<b>Grafana</b><br/><font point-size="9">live tile, refresh 30 s</font>>,
+           fillcolor="#E8F5EC", color="#3F8F5A"]
+  check [label=<<b>make stream-check</b><br/><font point-size="9">recount from the topic<br/>vs. Postgres</font>>,
+         style="rounded,dashed", fillcolor="white"]
+
+  wiki -> producer [label="HTTP stream"]
+  producer -> topic [label="edits + new pages"]
+  topic -> flink
+  flink -> pg [label="closed windows"]
+  pg -> grafana
+  topic -> check [style=dashed, constraint=false]
+  pg -> check [style=dashed]
+}
