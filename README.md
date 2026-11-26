@@ -20,6 +20,7 @@ Measured on the October 2026 backfill (2026-11-25). `make metrics` recomputes th
 | Tests | **76** dbt tests (incl. 3 unit tests) + **118** Python tests; 6 CI jobs on every PR | [data quality](#data-quality), [CI/CD](#cicd) |
 | Slim CI | Editing one model builds **14 of 56** nodes (65 s instead of 123 s) | [CI/CD](#cicd) |
 | Cloud cost | **≈ $2** for the month (BigQuery within the free tier) | [cost](#cost) |
+| Streaming | Wikimedia edits in 5-min windows, live in **62 s**; recount from the topic matches **60/60 windows exactly** | [streaming](#streaming-stretch-goal) |
 
 ## Problem
 
@@ -61,6 +62,7 @@ Looker Studio reads two small mart tables. The diagram source is [docs/diagrams/
 | Transformation | **dbt** | Tests that gate downstream models, incremental partition replacement, lineage and docs | Scheduled SQL: no tests or lineage |
 | Orchestration | **Airflow 3** (Docker Compose) | Data-interval scheduling, catchup/backfill, retries, deferrable Dataproc operator, failure callbacks | Cloud Composer: managed, but several hundred dollars a month even when idle; Dagster: also good, less common in job ads |
 | Dashboard | **Looker Studio** | Free, native BigQuery connector, shareable link | Metabase/Superset: needs hosting |
+| Streaming | **Redpanda + Flink SQL + Postgres + Grafana** (Docker) | Kafka API without ZooKeeper/JVM (Redpanda); event-time windows, checkpoints and upsert sinks in plain SQL (Flink); a dashboard that can actually refresh every 30 s (Grafana) | Spark Structured Streaming: micro-batches, weaker event-time semantics; Looker Studio: no live refresh from a local DB |
 | CI/CD | **GitHub Actions** + Workload Identity Federation | Every PR: lint (Python, SQL, Terraform), tests, secret scan, DAG import, and a real dbt build on BigQuery, with no stored GCP key | JSON key in GitHub Secrets: long-lived, can leak |
 
 ## Data model
@@ -283,6 +285,50 @@ Checks at every layer. A failure stops the run before bad data reaches the next 
 
 It reads only `agg_events_hourly` (1 MB) and `rpt_top_repos_7d` (10 rows), never `raw` and never the big marts. Each chart refresh is a billed query: on `fct_events` the same tiles would scan ~1 GB, and here each stays at the 10 MB minimum. Build spec: [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
+## Streaming (stretch goal)
+
+![streaming](docs/streaming.png)
+
+![Grafana live dashboard](docs/streaming_dashboard.png)
+
+*The live dashboard: about 4,400 edits per 5-minute window across all Wikimedia wikis, written 64 s after each window ends; data 1.2 min old. In this hour **61% of edits came from bots**, led by Wikimedia Commons and Wikidata, then English Wikipedia.*
+
+The batch pipeline answers "what happened yesterday". This adds the other half of data engineering: a **live** aggregate, with the same standard of proof. Source: [Wikimedia EventStreams](https://stream.wikimedia.org/?doc), every edit on every Wikimedia wiki as Server-Sent Events, about 37 events/s. GitHub has no comparable public push stream.
+
+| Stage | What | Design choice |
+|---|---|---|
+| [wiki_producer.py](streaming/producer/wiki_producer.py) | SSE → Redpanda topic `wiki.recentchange` (3 partitions, key = wiki, 24 h retention) | Resumes with `Last-Event-ID` after a reconnect or restart (no gap); idempotent producer, `acks=all`; editor names **hashed**, never stored |
+| [wiki_edits_5min.sql](streaming/flink/sql/wiki_edits_5min.sql) | Flink 2.2 SQL: 5-minute **event-time** tumbling windows per wiki | Watermark 1 min for low latency; **allowed lateness 6 h** with late firing for completeness; `COUNT(DISTINCT event_id)` makes replays harmless; exactly-once checkpoints every 30 s |
+| [Postgres](streaming/postgres/init.sql) | `wiki_edits_5min`, primary key `(window_start, wiki)` | JDBC **upsert**: a late re-fire or a recomputed window overwrites its row |
+| [Grafana](streaming/grafana/dashboards/wiki_edits_live.json) | Live dashboard, refreshes every 30 s | Provisioned as code; read-only database role |
+| [submit-job.sh](streaming/flink/submit-job.sh) | Idempotent job submit | Resumes from the latest retained checkpoint; done only when a checkpoint **completes** |
+
+**Proven, not assumed** (`make stream-check` recounts every window from the topic and compares it with Postgres):
+
+| Test | Result |
+|---|---|
+| Reconciliation, 60 windows (5 hours) | **0.00% gap in every window**, including 2 hours the producer replayed after the laptop slept |
+| End-to-end latency, live | **62 s** from window end to Postgres (1-minute watermark + ~2 s) |
+| Backlog | 15 hours (1.12M edits) processed in ~4 min after a restart |
+| Kill the Flink TaskManager | Back to RUNNING in 48 s, restored from checkpoint 4; that window still matches the topic exactly |
+| Stop the whole stack for 2 min | Flink restored from its retained checkpoint; the producer replayed the outage at 189 events/s; that window matches exactly (no loss, no double count) |
+
+**What broke first** (details in the [DEVLOG](docs/DEVLOG.md)):
+- **A silent 14-hour crash loop.** The Kafka connector doesn't bundle zstd, and the producer used it.
+- **42% of edits dropped as late.** A replay after the laptop slept arrives out of order, and a 1-minute watermark can't absorb it.
+
+Both are fixed, and each fix has a check that would catch it again.
+
+```bash
+make stream-up        # Grafana http://localhost:3000 · Flink http://localhost:8082 · Redpanda Console http://localhost:8083
+make stream-status    # containers, Flink job state, newest windows and their latency
+make stream-check     # reconcile the last 6 closed windows with the topic
+make stream-down      # stop; topic, checkpoints and Postgres are kept (next stream-up resumes)
+make stream-up FRESH=1   # after changing the SQL: old state no longer fits, start over from the topic
+```
+
+About 1.9 GB of memory, so it runs next to Airflow on an 8 GB Docker VM.
+
 ## CI/CD
 
 Every pull request runs [.github/workflows/ci.yml](.github/workflows/ci.yml). `main` is protected: a PR can only merge when all checks pass, and all work goes through feature branches.
@@ -426,6 +472,8 @@ What this project actually used from 2026-11-01 to 11-19. That covers every deve
 | **CI builds a fixed 2-day window** (Oct 30–31) | A bug that only shows on other days' data passes CI | Pick the latest loaded days via `INFORMATION_SCHEMA.PARTITIONS`, or add a weekly wider build | ~1 h, ~free |
 | **No CD for infrastructure or the Spark job** | `terraform apply` and `make spark-upload` are run by hand after merging | A `main`-only job: `terraform plan` on PRs, `apply` + `spark-upload` after merge, with its own narrowly-scoped service account | ~half a day, free |
 | **Enrichment covers the top 1,000 repos only** | Language is known for repos that get 33% of stars; the long tail shows as `not enriched` | Raise `--top-n` (5,000/hour allows ~100k repos a day), or use the GraphQL API to fetch 100 repos per call | free, ~1 h |
+| **Streaming runs on a laptop, single-node Redpanda in dev mode** | Sleep pauses it (the producer then replays, out of order); no replication | Managed Kafka (or Redpanda Cloud) and a Flink operator on Kubernetes, or Managed Flink | ~$100+/month |
+| **Late firing uses Flink's legacy group window** | `GROUP BY TUMBLE` is deprecated; the window TVF doesn't support late firing in 2.2 | Move to the TVF when it gains late firing, or keep windows open longer with a bigger watermark and accept the latency | — |
 | **Spark runs one day at a time** | A month's backfill takes hours | Raise the `CPUS_ALL_REGIONS` quota to 24+ | free (quota request) |
 
 ## Repository layout
@@ -437,6 +485,7 @@ spark/                raw JSON → Parquet (flatten_events.py, tests)
 warehouse/            raw.events and load_log DDL, load script, cost benchmark
 dbt/oss_pulse/        staging → intermediate → marts, seeds, macros, tests
 airflow/              DAG, alert callback, Compose file, image, chaos test
+streaming/            Wikimedia producer, Flink SQL job, Postgres sink, Grafana dashboard, compose
 docs/                 DATA_NOTES, DEVLOG, DASHBOARD, diagrams and screenshots
 .github/              CI workflow, Dependabot, PR template
 ```

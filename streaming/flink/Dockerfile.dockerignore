@@ -1,0 +1,4 @@
+# Build context for streaming/flink/Dockerfile: only the SQL job and its submit script.
+**
+!streaming/flink/sql/
+!streaming/flink/submit-job.sh

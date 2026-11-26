@@ -1,0 +1,4 @@
+# Build context for streaming/producer/Dockerfile: only the producer, nothing else.
+**
+!streaming/producer/requirements.txt
+!streaming/producer/wiki_producer.py
